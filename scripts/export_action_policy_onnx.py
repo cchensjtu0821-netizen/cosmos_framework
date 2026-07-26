@@ -1,0 +1,244 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+"""Export the fixed-shape RoboLab/DROID Cosmos3 Policy denoiser to ONNX.
+
+This exports one MoT denoise network call, not the Python tokenizer, VAE,
+SequencePlan builder, UniPC loop, or action postprocessing.  A real packed
+sequence is captured from the normal RoboLab preparation path so attention
+indexes and modality metadata exactly match the selected request shape.
+
+Example:
+  python -m cosmos_framework.scripts.export_action_policy_onnx \
+    --checkpoint-path /checkpoints/Cosmos3-Nano-Policy-DROID \
+    --output-path /tmp/cosmos3_policy_denoiser.onnx
+"""
+
+from cosmos_framework.inference.common.init import init_script
+
+init_script()
+
+import copy
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pydantic
+import torch
+
+from cosmos_framework.scripts.action_policy_server_robolab import (
+    RobolabPolicyService,
+    RobolabServerArgs,
+    _build_data_batch_from_sample,
+)
+
+
+class ExportArgs(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    checkpoint_path: str = "nvidia/Cosmos3-Nano-Policy-DROID"
+    output_path: Path = Path("cosmos3_policy_denoiser.onnx")
+    prompt: str = "Pick up the object and place it in the target location."
+    image_height: int = 540
+    image_width: int = 640
+    action_chunk_size: int = 32
+    action_dim: int = 8
+    conditioning_fps: float = 15.0
+    resolution: str | None = "480"
+    domain_name: str = "droid_lerobot"
+    opset_version: int = 18
+    verify_onnx: bool = True
+    export_report: bool = True
+
+
+class _PackedSequenceCaptured(RuntimeError):
+    pass
+
+
+def _clone_modality(modality: Any) -> Any:
+    return copy.copy(modality) if modality is not None else None
+
+
+class PolicyDenoiserOnnxWrapper(torch.nn.Module):
+    """Tensor-only ONNX boundary around one fixed-layout MoT forward."""
+
+    def __init__(self, net: torch.nn.Module, packed_template: Any) -> None:
+        super().__init__()
+        self.net = net
+        self.packed_template = packed_template
+
+    def forward(
+        self,
+        prompt_token_ids: torch.Tensor,
+        video_latent: torch.Tensor,
+        action_latent: torch.Tensor,
+        vision_timestep: torch.Tensor,
+        action_timestep: torch.Tensor,
+        action_domain_id: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        packed = copy.copy(self.packed_template)
+        packed.vision = _clone_modality(self.packed_template.vision)
+        packed.action = _clone_modality(self.packed_template.action)
+        packed.text_ids = prompt_token_ids
+
+        assert packed.vision is not None
+        packed.vision.tokens = [video_latent]
+        packed.vision.timesteps = vision_timestep
+
+        assert packed.action is not None
+        packed.action.tokens = [action_latent]
+        packed.action.timesteps = action_timestep
+        packed.action.domain_id = [action_domain_id]
+
+        outputs = self.net(packed_seq=packed)
+        return outputs["preds_vision"][0], outputs["preds_action"][0]
+
+
+def _dummy_observation(args: ExportArgs) -> dict[str, Any]:
+    return {
+        "prompt": args.prompt,
+        "observation/image": np.zeros((args.image_height, args.image_width, 3), dtype=np.uint8),
+        "observation/joint_position": np.zeros((1, 7), dtype=np.float32),
+        "observation/gripper_position": np.zeros((1, 1), dtype=np.float32),
+    }
+
+
+def _capture_first_packed_sequence(service: RobolabPolicyService, data_batch: dict[str, Any]) -> Any:
+    captured: dict[str, Any] = {}
+
+    def hook(_module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        packed = kwargs.get("packed_seq")
+        if packed is None and args:
+            packed = args[0]
+        captured["packed"] = packed
+        raise _PackedSequenceCaptured
+
+    handle = service.model.net.register_forward_pre_hook(hook, with_kwargs=True)
+    try:
+        with torch.inference_mode():
+            service.model.generate_samples_from_batch(
+                data_batch,
+                guidance=1.0,
+                seed=[0],
+                num_steps=1,
+                shift=5.0,
+            )
+    except _PackedSequenceCaptured:
+        pass
+    finally:
+        handle.remove()
+    if captured.get("packed") is None:
+        raise RuntimeError("Failed to capture the packed Policy input before the MoT network forward")
+    return captured["packed"]
+
+
+def _example_inputs(packed: Any) -> tuple[torch.Tensor, ...]:
+    if packed.vision is None or not packed.vision.tokens:
+        raise ValueError("Captured Policy input has no vision tokens")
+    if packed.action is None or not packed.action.tokens or not packed.action.domain_id:
+        raise ValueError("Captured Policy input has no action tokens/domain ID")
+    return (
+        packed.text_ids,
+        packed.vision.tokens[0],
+        packed.action.tokens[0],
+        packed.vision.timesteps,
+        packed.action.timesteps,
+        packed.action.domain_id[0],
+    )
+
+
+def _shape_manifest(names: tuple[str, ...], tensors: tuple[torch.Tensor, ...]) -> dict[str, Any]:
+    return {
+        name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "device": str(tensor.device)}
+        for name, tensor in zip(names, tensors)
+    }
+
+
+def export_action_policy_onnx(args: ExportArgs) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("The Cosmos3 Policy exporter requires a CUDA environment")
+
+    server_args = RobolabServerArgs(
+        checkpoint_path=args.checkpoint_path,
+        image_height=args.image_height,
+        image_width=args.image_width,
+        action_chunk_size=args.action_chunk_size,
+        action_dim=args.action_dim,
+        conditioning_fps=args.conditioning_fps,
+        resolution=args.resolution,
+        domain_name=args.domain_name,
+        guidance=1.0,
+        num_steps=1,
+    )
+    service = RobolabPolicyService(server_args)
+    sample = service._build_sample(_dummy_observation(args))
+    data_batch = _build_data_batch_from_sample(sample)
+    packed = _capture_first_packed_sequence(service, data_batch)
+
+    wrapper = PolicyDenoiserOnnxWrapper(service.model.net, packed).eval()
+    inputs = _example_inputs(packed)
+    input_names = (
+        "prompt_token_ids",
+        "video_latent",
+        "action_latent",
+        "vision_timestep",
+        "action_timestep",
+        "action_domain_id",
+    )
+    output_names = ("vision_velocity", "action_velocity")
+
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode():
+        reference_outputs = wrapper(*inputs)
+        torch.onnx.export(
+            wrapper,
+            inputs,
+            str(args.output_path),
+            input_names=list(input_names),
+            output_names=list(output_names),
+            opset_version=args.opset_version,
+            dynamo=True,
+            external_data=True,
+            report=args.export_report,
+        )
+
+    manifest = {
+        "scope": "one fixed-layout Cosmos3 Policy MoT denoise forward",
+        "checkpoint_path": args.checkpoint_path,
+        "inputs": _shape_manifest(input_names, inputs),
+        "outputs": _shape_manifest(output_names, reference_outputs),
+        "settings": {
+            "prompt": args.prompt,
+            "image_height": args.image_height,
+            "image_width": args.image_width,
+            "action_chunk_size": args.action_chunk_size,
+            "action_dim": args.action_dim,
+            "conditioning_fps": args.conditioning_fps,
+            "resolution": args.resolution,
+            "domain_name": args.domain_name,
+            "opset_version": args.opset_version,
+        },
+    }
+    manifest_path = args.output_path.with_suffix(args.output_path.suffix + ".json")
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+
+    if args.verify_onnx:
+        try:
+            import onnx
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("Install `onnx` to run structural verification") from exc
+        onnx.checker.check_model(str(args.output_path))
+
+    print(f"ONNX saved to: {args.output_path}")
+    print(f"Shape manifest saved to: {manifest_path}")
+
+
+def main() -> None:
+    import tyro
+
+    export_action_policy_onnx(tyro.cli(ExportArgs, description=__doc__))
+
+
+if __name__ == "__main__":
+    main()
