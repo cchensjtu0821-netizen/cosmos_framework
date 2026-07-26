@@ -25,6 +25,8 @@ class ModuleProfiler:
         self._cpu_samples: dict[str, list[float]] = defaultdict(list)
         self._cuda_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._counters: dict[str, int] = defaultdict(int)
+        self._flops: dict[str, int] = defaultdict(int)
+        self._active_regions: list[str] = []
         self._finalized = False
 
     @contextmanager
@@ -33,9 +35,11 @@ class ModuleProfiler:
             yield
             return
         start = time.perf_counter()
+        self._active_regions.append(name)
         try:
             yield
         finally:
+            self._active_regions.pop()
             self._cpu_samples[name].append((time.perf_counter() - start) * 1000.0)
 
     @contextmanager
@@ -46,15 +50,29 @@ class ModuleProfiler:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
+        self._active_regions.append(name)
         try:
             yield
         finally:
+            self._active_regions.pop()
             end.record()
             self._cuda_events[name].append((start, end))
 
     def increment(self, name: str, value: int = 1) -> None:
         if self.enabled:
             self._counters[name] += value
+
+    def add_flops(self, name: str, value: int) -> None:
+        """Record theoretical FLOPs and roll them up through active regions."""
+        if not self.enabled:
+            return
+        value = int(value)
+        if value < 0:
+            raise ValueError(f"FLOPs must be non-negative, got {value} for {name!r}")
+        self._flops[name] += value
+        for region in dict.fromkeys(self._active_regions):
+            if region != name:
+                self._flops[region] += value
 
     @staticmethod
     def _summary(samples: list[float]) -> dict[str, float | int]:
@@ -92,6 +110,10 @@ class ModuleProfiler:
             "cpu": {name: self._summary(values) for name, values in self._cpu_samples.items()},
             "cuda": {name: self._summary(values) for name, values in cuda_samples.items()},
             "counters": dict(self._counters),
+            "flops": {
+                name: {"total": value, "tflops": value / 1e12}
+                for name, value in self._flops.items()
+            },
             "memory": memory,
         }
 
@@ -110,3 +132,9 @@ def profile_increment(owner: Any, name: str, value: int = 1) -> None:
     profiler = getattr(owner, "_module_profiler", None)
     if profiler is not None:
         profiler.increment(name, value)
+
+
+def profile_flops(owner: Any, name: str, value: int) -> None:
+    profiler = getattr(owner, "_module_profiler", None)
+    if profiler is not None:
+        profiler.add_flops(name, value)

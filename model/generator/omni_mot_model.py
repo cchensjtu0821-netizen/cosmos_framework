@@ -23,7 +23,8 @@ from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.count_params import count_params
 from cosmos_framework.utils.timer import Timer
-from cosmos_framework.utils.module_profiler import profile_cpu, profile_cuda, profile_increment
+from cosmos_framework.tools.flops.wan_vae import compute_wan_vae_encoder_flops
+from cosmos_framework.utils.module_profiler import profile_cpu, profile_cuda, profile_flops, profile_increment
 from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
 from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
@@ -2934,6 +2935,12 @@ class OmniMoTModel(ImaginaireModel):
             for raw_state_vision_i in raw_state_vision:
                 with profile_cuda(self, "vae_encode"):
                     encoded = self.encode(raw_state_vision_i)
+                    _, _, pixel_t, pixel_h, pixel_w = raw_state_vision_i.shape
+                    profile_flops(
+                        self,
+                        "vae_encode",
+                        int(compute_wan_vae_encoder_flops(B=1, T=pixel_t, H=pixel_h, W=pixel_w)),
+                    )
                 with profile_cuda(self, "vae_output_cast"):
                     encoded = encoded.contiguous().float()
                 x0_tokens_vision.append(encoded)

@@ -577,9 +577,11 @@ class RobolabPolicyService:
     def _infer_profiled(self, obs: dict[str, Any], profiler: ModuleProfiler) -> dict[str, Any]:
         with profiler.cpu("build_sample"):
             sample = self._build_sample(obs)
+            profiler.add_flops("build_sample", 0)
         with profiler.cpu("build_batch"):
             data_batch = _build_data_batch_from_sample(sample)
             seed = self._next_seed()
+            profiler.add_flops("build_batch", 0)
         log.info(f"[robolab-policy-server] prompt={data_batch['ai_caption'][0]!r} seed={seed}")
 
         with self._lock:
@@ -613,6 +615,7 @@ class RobolabPolicyService:
                 position = abs_pose[1:, :3, 3]
                 quat_xyzw = convert_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
                 action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
+            profiler.add_flops("action_postprocess", 0)
 
         outputs: dict[str, Any] = {"action": action_np}
         if self.cfg.decode_video:
@@ -620,8 +623,10 @@ class RobolabPolicyService:
                 pred_vision_latent = samples["vision"][0]  # [C,T,H,W]
                 video = self.model.decode(pred_vision_latent)  # [1,C,T,H,W]
                 video = ((video[0].clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 3, 0)
+                profiler.add_flops("vae_decode", 0)
             with profiler.cpu("video_to_numpy"):
                 outputs["video"] = video.detach().cpu().numpy()
+                profiler.add_flops("video_to_numpy", 0)
         return outputs
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
@@ -683,6 +688,11 @@ class RobolabPolicyService:
                 "guidance": self.cfg.guidance,
                 "decode_video": self.cfg.decode_video,
                 "observed_flops": observed_flops,
+                "flops_convention": "theoretical forward FLOPs; one multiply-add = 2 FLOPs",
+                "zero_flops_regions": (
+                    "CPU/data-movement regions and vae_decode (decoder estimator unavailable) "
+                    "are reported as 0 rather than guessed"
+                ),
             }
             self._append_profile_report(report)
             generator_ms = report.get("cuda", {}).get("generator_total", {}).get("total_ms")

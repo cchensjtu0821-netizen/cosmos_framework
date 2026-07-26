@@ -19,7 +19,8 @@ from cosmos_framework.model.generator.mot.modeling_utils import TimestepEmbedder
 from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
 from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
-from cosmos_framework.utils.module_profiler import profile_cuda
+from cosmos_framework.tools.flops.inference import compute_policy_forward_flops
+from cosmos_framework.utils.module_profiler import profile_cuda, profile_flops
 
 
 class Cosmos3VFMNetworkConfig(PretrainedConfig):
@@ -908,24 +909,34 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # This is intentional for proper batch norm / dropout behavior
         # assert self.training, "Cosmos3VFMNetwork only supports training mode"
 
+        inference_flops = (
+            compute_policy_forward_flops(self, packed_seq)
+            if getattr(self, "_module_profiler", None) is not None
+            else {}
+        )
+
         with profile_cuda(self, "encode_text"):
             packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
+            profile_flops(self, "encode_text", inference_flops.get("encode_text", 0))
 
         # encode vision tokens
         original_latent_shapes: List[Tuple[int, int, int]] | None = None
         if self.config.vision_gen:
             with profile_cuda(self, "encode_vision"):
                 original_latent_shapes = self._encode_vision(packed_seq, packed_sequence, target_dtype)
+                profile_flops(self, "encode_vision", inference_flops.get("encode_vision", 0))
 
         # encode action tokens
         if self.config.action_gen:
             with profile_cuda(self, "encode_action"):
                 self._encode_action(packed_seq, packed_sequence, target_dtype)
+                profile_flops(self, "encode_action", inference_flops.get("encode_action", 0))
 
         # encode sound tokens
         if self.config.sound_gen:
             with profile_cuda(self, "encode_sound"):
                 self._encode_sound(packed_seq, packed_sequence, target_dtype)
+                profile_flops(self, "encode_sound", inference_flops.get("encode_sound", 0))
 
         assert packed_seq.attn_modes is not None
         assert packed_seq.split_lens is not None
@@ -1067,6 +1078,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 natten_metadata_list=natten_metadata_list,
                 memory=memory,
             )
+            profile_flops(self, "mot_joint_forward", inference_flops.get("mot_joint_forward", 0))
         last_hidden_state = get_context_parallel_last_hidden_state(
             packed_outputs=packed_outputs,
             parallel_dims=sequence_shard_parallel_dims,
@@ -1077,16 +1089,19 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if self.config.vision_gen:
             with profile_cuda(self, "vision_head"):
                 self._decode_vision(packed_seq, last_hidden_state, output_dict, original_latent_shapes)
+                profile_flops(self, "vision_head", inference_flops.get("vision_head", 0))
 
         # decode action tokens
         if self.config.action_gen:
             with profile_cuda(self, "action_head"):
                 self._decode_action(packed_seq, last_hidden_state, output_dict)
+                profile_flops(self, "action_head", inference_flops.get("action_head", 0))
 
         # decode sound tokens
         if self.config.sound_gen:
             with profile_cuda(self, "sound_head"):
                 self._decode_sound(packed_seq, last_hidden_state, output_dict)
+                profile_flops(self, "sound_head", inference_flops.get("sound_head", 0))
 
         output_dict.update(last_hidden_state=last_hidden_state)
         for lbl_metadata_key, lbl_metadata_value in lbl_metadata.items():
