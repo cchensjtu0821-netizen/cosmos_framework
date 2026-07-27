@@ -32,6 +32,11 @@ def test_public_model_config_round_trip_removes_internal_metadata():
                 "_target_": "cosmos_framework.configs.base.defaults.compile.CompileConfig",
                 "enabled": False,
             },
+            "fixed_step_sampler_config": {
+                "_type": "cosmos_framework.configs.base.defaults.model_config.FixedStepSamplerConfig",
+                "sample_type": "sde",
+                "t_list": [1.0, 0.9375, 0.8333333333333334, 0.625],
+            },
             "tokenizer": {
                 "_target_": "cosmos_framework.model.generator.tokenizers.wan2pt2_vae_4x16x16.Wan2pt2VAEInterface",
                 "vae_path": "pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth",
@@ -61,6 +66,7 @@ def test_public_model_config_round_trip_removes_internal_metadata():
     assert public_model_config["_target"] == "omni_mot_model"
     assert public_model_config["config"]["_type"] == "omni_mot_model_config"
     assert public_model_config["config"]["compile"]["_target"] == "compile_config"
+    assert public_model_config["config"]["fixed_step_sampler_config"]["_type"] == "fixed_step_sampler_config"
     assert "projects.cosmos3" not in text
     assert "projects/cosmos3" not in text
     assert "cosmos3._src" not in text
@@ -70,3 +76,26 @@ def test_public_model_config_round_trip_removes_internal_metadata():
     assert restored == model_config
     assert load_model_config_from_hf_config({"model": public_model_config}) == model_config
     assert load_model_config_from_hf_config({"model": model_config}) == model_config
+
+
+def test_restore_nemotron3_dense_vl_public_aliases():
+    public_model_config = {
+        "model": {
+            "_target": "nemotron3_dense_vl_text_for_causal_lm",
+            "config": {
+                "_target": "nemotron3_dense_vl_mot_config_from_json_file",
+                "json_file": "cosmos3://vfm/models/vlm/nemotron_3_dense_vl/config.json",
+            },
+        }
+    }
+
+    restored = load_model_config_from_hf_config(public_model_config)
+
+    assert (
+        restored["_target_"]
+        == "cosmos_framework.model.generator.mot.unified_mot.Nemotron3DenseVLTextForCausalLM"
+    )
+    assert (
+        restored["config"]["_target_"]
+        == "cosmos_framework.model.generator.mot.unified_mot.Nemotron3DenseVLMoTConfig.from_json_file"
+    )
