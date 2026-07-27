@@ -185,11 +185,11 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
         use_torch_compile=False,
     )
     service = RobolabPolicyService(server_args)
-    replaced_attention_modules = _install_onnx_attention(service.model.net)
-    print(f"Using ONNX dense attention in {replaced_attention_modules} module(s)")
     sample = service._build_sample(_dummy_observation(args))
     data_batch = _build_data_batch_from_sample(sample)
     packed = _capture_first_packed_sequence(service, data_batch)
+    replaced_attention_modules = _install_onnx_attention(service.model.net)
+    print(f"Using ONNX dense attention in {replaced_attention_modules} module(s)")
 
     wrapper = PolicyDenoiserOnnxWrapper(service.model.net, packed).eval()
     inputs = _example_inputs(packed)
