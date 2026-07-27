@@ -178,21 +178,21 @@ def _simplified_output_path(args: ExportArgs) -> Path:
 def _simplify_onnx(source_path: Path, output_path: Path) -> None:
     try:
         import onnx
-        import onnxsim
+        import onnxslim
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("Install `onnxsim` to simplify the exported ONNX model") from exc
+        raise ModuleNotFoundError("Install `onnxslim` to simplify the exported ONNX model") from exc
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    simplified_model, check_ok = onnxsim.simplify(str(source_path))
-    if not check_ok:
-        raise RuntimeError("onnxsim numerical validation failed")
-    onnx.save_model(
-        simplified_model,
+    onnxslim.slim(
+        str(source_path),
         str(output_path),
         save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=f"{output_path.name}.data",
-        size_threshold=1024,
+        # ONNX shape inference serializes an in-memory ModelProto and therefore
+        # cannot process this multi-GB model even when its weights originated
+        # as external data.
+        no_shape_infer=True,
+        # Avoid constant folding that materializes very large derived tensors.
+        size_threshold=1024 * 1024,
     )
     onnx.checker.check_model(str(output_path))
 

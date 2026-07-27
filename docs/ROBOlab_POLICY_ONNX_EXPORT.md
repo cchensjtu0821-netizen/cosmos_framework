@@ -49,7 +49,7 @@ lowering 的自定义 CUDA 算子。该替换只作用于导出模型，不改�
 - 可正常运行 Cosmos3-Nano-Policy-DROID 推理的 CUDA 环境；
 - PyTorch 及项目完整依赖；
 - `onnx`；
-- `onnxsim`（默认执行图简化，可用 `--no-simplify-onnx` 关闭）；
+- `onnxslim`（默认执行图简化，可用 `--no-simplify-onnx` 关闭）；
 - PyTorch dynamo ONNX exporter 所需依赖（通常包含 `onnxscript`）。
 
 建议额外安装 `onnxruntime-gpu`，用于后续数值对比。
