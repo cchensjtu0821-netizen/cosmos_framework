@@ -380,6 +380,8 @@ class RobolabPolicyService:
             f"[robolab-policy-server] loading model: checkpoint_path={setup_args.checkpoint_path!r} "
             f"config_file={setup_args.config_file!r} experiment={setup_args.experiment!r}"
         )
+        setup_args.guardrails = False
+        setup_args.offload_guardrail_models = False
         pipe = OmniInference.create(setup_args)
         self.pipe: OmniInference = pipe
         self.model = pipe.model

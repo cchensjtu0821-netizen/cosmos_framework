@@ -312,16 +312,58 @@ class CheckpointConfig(pydantic.BaseModel):
         if INTERNAL:
             return self.s3.uri
 
+        local_checkpoints = {
+            "Wan2.2/vae": (
+                "/srv/data2/c00932551/Nvidia_models/Wan2.2/"
+                "Wan2.2_VAE.pth"
+            ),
+        }
+
+        local_path = local_checkpoints.get(self.name)
+        if local_path is not None:
+            local_path = os.path.abspath(local_path)
+
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(
+                    f"Local checkpoint for {self.name!r} does not exist: "
+                    f"{local_path}"
+                )
+
+            log.info(
+                f"Using local checkpoint {self.full_name}: {local_path}"
+            )
+
+            if self.post_download is not None:
+                self.post_download(local_path)
+
+            return local_path
+
         include = getattr(self.hf, "include", ())
         if include:
-            _config_patterns = {"*.json", "*.txt", "*.yaml", "*.yml", "*.md"}
-            kind = "tokenizer/config files" if set(include).issubset(_config_patterns) else "files"
-            log.info(f"Downloading {self.hf.repository} {kind} ({', '.join(include)})")
+            _config_patterns = {
+                "*.json",
+                "*.txt",
+                "*.yaml",
+                "*.yml",
+                "*.md",
+            }
+            kind = (
+                "tokenizer/config files"
+                if set(include).issubset(_config_patterns)
+                else "files"
+            )
+            log.info(
+                f"Downloading {self.hf.repository} {kind} "
+                f"({', '.join(include)})"
+            )
         else:
             log.info(f"Downloading checkpoint {self.full_name}")
+
         path = self.hf.download()
+
         if self.post_download is not None:
             self.post_download(path)
+
         return path
 
     @classmethod
