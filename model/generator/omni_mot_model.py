@@ -6,7 +6,7 @@ from __future__ import annotations
 import collections
 import json
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
