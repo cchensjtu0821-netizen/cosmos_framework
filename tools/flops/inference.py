@@ -15,6 +15,7 @@ def _descriptor(net: Any):
     text_cfg = getattr(vlm_cfg, "text_config", vlm_cfg)
     net_cfg = net.config
     num_experts = int(getattr(text_cfg, "num_experts", 0))
+    sound_dim_value = getattr(net_cfg, "sound_dim", None)
     return get_omni_mot_model_descriptor(
         hidden_size=int(text_cfg.hidden_size),
         num_hidden_layers=int(text_cfg.num_hidden_layers),
@@ -32,7 +33,7 @@ def _descriptor(net: Any):
         latent_patch_size=int(getattr(net_cfg, "latent_patch_size", 2)),
         latent_channel_size=int(getattr(net_cfg, "latent_channel_size", 48)),
         action_dim=int(getattr(net_cfg, "action_dim", 32)),
-        sound_dim=int(getattr(net_cfg, "sound_dim", None) or 64),
+        sound_dim=int(sound_dim_value if sound_dim_value is not None else 64),
         frequency_embedding_size=int(getattr(net_cfg, "frequency_embedding_size", 256)),
         predict_text_tokens=bool(getattr(net_cfg, "predict_text_tokens", False)),
     )
