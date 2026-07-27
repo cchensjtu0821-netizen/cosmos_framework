@@ -38,6 +38,9 @@ ONNX 不包含：
 
 video latent、模型内部 action 宽度、prompt token 数和 timestep shape 不手工猜测。脚本会使用正常 RoboLab Policy 预处理执行一次请求，在 MoT forward 前捕获真实 `PackedSequence`，据此生成 ONNX example inputs，并输出同名 `.onnx.json` shape manifest。
 
+导出器会关闭服务端默认启用的 `torch.compile`，确保 PyTorch ONNX
+exporter 捕获 eager 模型，而不是已经由 Inductor 包装过的模型区域。
+
 ## 环境要求
 
 - 可正常运行 Cosmos3-Nano-Policy-DROID 推理的 CUDA 环境；

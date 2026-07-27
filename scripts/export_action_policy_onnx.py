@@ -170,6 +170,7 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
         domain_name=args.domain_name,
         guidance=1.0,
         num_steps=1,
+        use_torch_compile=False,
     )
     service = RobolabPolicyService(server_args)
     sample = service._build_sample(_dummy_observation(args))

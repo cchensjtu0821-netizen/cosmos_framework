@@ -358,6 +358,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """State/history action rows to trim from the generated action output."""
     enable_module_profile: bool = False
     """Write lightweight per-request CPU/CUDA module timings as JSONL."""
+    use_torch_compile: bool = True
+    """Compile model regions for serving. Disable for graph export and debugging."""
     profile_every_n: int = pydantic.Field(default=1, ge=1)
     """Profile every Nth request when module profiling is enabled."""
     profile_warmup_requests: int = pydantic.Field(default=3, ge=0)
@@ -441,6 +443,7 @@ class RobolabPolicyService:
             "checkpoint_path": args.checkpoint_path,
             "output_dir": args.output_dir or _DEFAULT_ROBOLAB_OUTPUT_DIR,
             "sampler": args.sampler,
+            "use_torch_compile": args.use_torch_compile,
         }
         if args.experiment is not None:
             setup_overrides["experiment"] = args.experiment
