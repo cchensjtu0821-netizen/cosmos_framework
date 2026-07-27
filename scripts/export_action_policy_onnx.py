@@ -27,6 +27,7 @@ import numpy as np
 import pydantic
 import torch
 
+from cosmos_framework.model.generator.mot.attention import dispatch_onnx_attention
 from cosmos_framework.scripts.action_policy_server_robolab import (
     RobolabPolicyService,
     RobolabServerArgs,
@@ -148,6 +149,17 @@ def _example_inputs(packed: Any) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _install_onnx_attention(net: torch.nn.Module) -> int:
+    replaced = 0
+    for module in net.modules():
+        if hasattr(module, "dispatch_attention_fn"):
+            module.dispatch_attention_fn = dispatch_onnx_attention
+            replaced += 1
+    if replaced == 0:
+        raise RuntimeError("Failed to find any attention modules for ONNX export")
+    return replaced
+
+
 def _shape_manifest(names: tuple[str, ...], tensors: tuple[torch.Tensor, ...]) -> dict[str, Any]:
     return {
         name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "device": str(tensor.device)}
@@ -173,6 +185,8 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
         use_torch_compile=False,
     )
     service = RobolabPolicyService(server_args)
+    replaced_attention_modules = _install_onnx_attention(service.model.net)
+    print(f"Using ONNX dense attention in {replaced_attention_modules} module(s)")
     sample = service._build_sample(_dummy_observation(args))
     data_batch = _build_data_batch_from_sample(sample)
     packed = _capture_first_packed_sequence(service, data_batch)

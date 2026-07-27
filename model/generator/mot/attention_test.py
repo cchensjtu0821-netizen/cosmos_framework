@@ -26,6 +26,26 @@ MAX_SEQ_LEN = 24
 SEQS_PER_BATCH = 4
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_onnx_dense_attention_matches_sdpa(is_causal: bool) -> None:
+    torch.manual_seed(0)
+    query = torch.randn(7, 4, 8)
+    key = torch.randn(7, 2, 8)
+    value = torch.randn(7, 2, 8)
+
+    actual = attention._onnx_dense_attention(query, key, value, is_causal=is_causal)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.transpose(0, 1),
+        key.repeat_interleave(2, dim=1).transpose(0, 1),
+        value.repeat_interleave(2, dim=1).transpose(0, 1),
+        is_causal=is_causal,
+    )
+    expected = expected.transpose(0, 1).flatten(-2, -1)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def _foreign_split_info(**overrides: object) -> SimpleNamespace:
     fields: dict[str, object] = {
         "max_causal_len": 1,

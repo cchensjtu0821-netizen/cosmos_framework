@@ -172,6 +172,90 @@ def two_way_attention(
     return out_all
 
 
+def _onnx_dense_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    is_causal: bool,
+) -> torch.Tensor:
+    """ONNX-friendly dense attention for a fixed single-sample packed layout."""
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    if num_query_heads != num_kv_heads:
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads})")
+        repeats = num_query_heads // num_kv_heads
+        key = key.repeat_interleave(repeats, dim=1)
+        value = value.repeat_interleave(repeats, dim=1)
+
+    query = query.transpose(0, 1)  # [H,Nq,D]
+    key = key.transpose(0, 1)  # [H,Nkv,D]
+    value = value.transpose(0, 1)  # [H,Nkv,Dv]
+    scale = query.shape[-1] ** -0.5
+    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if is_causal:
+        causal_mask = torch.triu(
+            torch.ones(scores.shape[-2:], dtype=torch.bool, device=scores.device),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    output = torch.matmul(probabilities, value).transpose(0, 1)
+    return output.flatten(-2, -1)
+
+
+def onnx_two_way_attention(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    packed_key_states_normalized: SequencePack | None = None,
+) -> SequencePack:
+    """Standard-operator replacement for fixed-layout, single-sample ONNX export."""
+    packed_key_normalized = (
+        packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
+    )
+    causal_q, _ = get_causal_seq(packed_query_states)
+    causal_k, _ = get_causal_seq(packed_key_states)
+    causal_v, _ = get_causal_seq(packed_value_states)
+    full_q, _ = get_full_only_seq(packed_query_states)
+
+    causal_out = _onnx_dense_attention(causal_q, causal_k, causal_v, is_causal=True)
+    full_out = _onnx_dense_attention(
+        full_q,
+        get_all_seq(packed_key_normalized),
+        get_all_seq(packed_value_states),
+        is_causal=False,
+    )
+    return from_mode_splits(causal_out, full_out, packed_query_states)
+
+
+def dispatch_onnx_attention(
+    packed_query_states: SequencePack,
+    packed_key_states: SequencePack,
+    packed_value_states: SequencePack,
+    attention_mask: SplitInfo,
+    natten_metadata: dict | None = None,
+    memory_value: MemoryValue | None = None,
+    packed_key_states_normalized: SequencePack | None = None,
+) -> tuple[SequencePack, KVToStore | None]:
+    """Dispatch fixed-layout ONNX export through standard PyTorch operators."""
+    del natten_metadata
+    if memory_value is not None:
+        raise ValueError("ONNX attention export does not support KV memory")
+    if attention_mask.is_three_way or attention_mask.control_stream_token_ranges is not None:
+        raise ValueError("ONNX attention export currently supports two-way attention only")
+    return (
+        onnx_two_way_attention(
+            packed_query_states,
+            packed_key_states,
+            packed_value_states,
+            packed_key_states_normalized=packed_key_states_normalized,
+        ),
+        None,
+    )
+
+
 def three_way_attention(
     packed_query_states: SequencePack,
     packed_key_states: SequencePack,

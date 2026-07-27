@@ -40,6 +40,9 @@ video latent、模型内部 action 宽度、prompt token 数和 timestep shape �
 
 导出器会关闭服务端默认启用的 `torch.compile`，确保 PyTorch ONNX
 exporter 捕获 eager 模型，而不是已经由 Inductor 包装过的模型区域。
+导出期间还会把两路 FlashAttention dispatch 替换为等价的 dense
+`MatMul + Softmax` 实现，因为 FlashAttention 2/3 是没有标准 ONNX
+lowering 的自定义 CUDA 算子。该替换只作用于导出模型，不改变正常服务。
 
 ## 环境要求
 
