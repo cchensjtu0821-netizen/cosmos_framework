@@ -180,6 +180,50 @@ def _split_multiview_tensor_by_view(
     return view_tensor.permute(1, 0, 2, 3, 4).contiguous()  # [V,C,F,H,W]
 
 
+def _decode_multiview_latent_per_view(
+    model: Any,
+    latent: torch.Tensor,
+    sample_n_views: int,
+    num_video_frames_per_view: int,
+) -> torch.Tensor:  # latent: [B,C,V*T_latent,H,W] or [C,V*T_latent,H,W], returns same rank with T=V*F
+    """Decode camera-major latent clips independently and concatenate their pixels."""
+    if latent.ndim not in (4, 5):
+        raise ValueError(
+            f"Multiview latents must have shape [B,C,T,H,W] or [C,T,H,W], got shape {tuple(latent.shape)}."
+        )
+
+    temporal_dim = latent.ndim - 3
+    num_latent_frames = int(latent.shape[temporal_dim])
+    if num_latent_frames % sample_n_views != 0:
+        raise ValueError(
+            "Multiview latent length must be divisible by sample_n_views: "
+            f"got T={num_latent_frames}, sample_n_views={sample_n_views}."
+        )
+
+    latent_frames_per_view = num_latent_frames // sample_n_views
+    decoded_views: list[torch.Tensor] = []
+    for view_idx in range(sample_n_views):
+        view_latent = latent.narrow(  # [B,C,T_latent,H,W] or [C,T_latent,H,W]
+            temporal_dim,
+            view_idx * latent_frames_per_view,
+            latent_frames_per_view,
+        )
+        decoded_view = model.decode(view_latent)  # [B,C,F,H_pixel,W_pixel] or [C,F,H_pixel,W_pixel]
+        if decoded_view.ndim != latent.ndim:
+            raise ValueError(
+                "Decoded multiview tensors must preserve the latent rank: "
+                f"got latent shape {tuple(view_latent.shape)} and decoded shape {tuple(decoded_view.shape)}."
+            )
+        if decoded_view.shape[temporal_dim] != num_video_frames_per_view:
+            raise ValueError(
+                "Decoded camera clip length must match num_video_frames_per_view: "
+                f"got T={decoded_view.shape[temporal_dim]}, expected {num_video_frames_per_view}."
+            )
+        decoded_views.append(decoded_view)
+
+    return torch.cat(decoded_views, dim=temporal_dim)  # [B,C,V*F,H_pixel,W_pixel] or [C,V*F,H_pixel,W_pixel]
+
+
 def _get_first_multiview_transfer_rows(
     raw_data: list[torch.Tensor] | None,
     metadata: MultiviewTransferMetadata,
@@ -215,6 +259,91 @@ def _add_wandb_image_paths(
             info[f"{key_prefix}_{key_suffix}"] = wandb.Image(image_path, caption=caption)
         return
     info[key_prefix] = wandb.Image(image_paths, caption=caption)
+
+
+def _pixel_tensor_to_5d(t: torch.Tensor) -> torch.Tensor:
+    """Ensure a pixel tensor has shape (B, C, T, H, W) for the visualization grid.
+
+    Handles (C, H, W), (B, C, H, W), and (B, C, T, H, W) inputs.
+    """
+    if t.ndim == 3:
+        return t.unsqueeze(0).unsqueeze(2)  # (C,H,W) -> (1,C,1,H,W)
+    if t.ndim == 4:
+        return t.unsqueeze(2)  # (B,C,H,W) -> (B,C,1,H,W)
+    return t
+
+
+def _resize_5d_to_width(img5d: torch.Tensor, target_width: int) -> torch.Tensor:
+    """Resize a single-frame (1, C, 1, H, W) tensor so its width is exactly ``target_width``.
+
+    Height is scaled proportionally to preserve the overall aspect ratio. Assumes a
+    single temporal frame (T == 1).
+    """
+    h, w = img5d.shape[-2], img5d.shape[-1]
+    if w == target_width:
+        return img5d
+    new_h = max(1, round(h * target_width / w))
+    chw = img5d[0, :, 0]  # (C,H,W)
+    resized = torchvision_F.resize(chw, [new_h, target_width], antialias=True)  # (C,new_h,target_width)
+    return resized.unsqueeze(0).unsqueeze(2)  # (1,C,1,new_h,target_width)
+
+
+def _resize_pad_to_square(img5d: torch.Tensor, cell: int) -> torch.Tensor:
+    """Resize a single-frame (1, C, 1, H, W) tensor to fit inside a ``cell`` x ``cell`` square.
+
+    Aspect ratio is preserved (the image is scaled so its longer side equals ``cell``), then
+    the result is center-padded with zeros to exactly ``cell`` x ``cell``. Assumes T == 1.
+    """
+    h, w = img5d.shape[-2], img5d.shape[-1]
+    scale = cell / max(h, w)
+    new_h = max(1, round(h * scale))
+    new_w = max(1, round(w * scale))
+    chw = img5d[0, :, 0]  # (C,H,W)
+    resized = torchvision_F.resize(chw, [new_h, new_w], antialias=True)  # (C,new_h,new_w)
+    pad_h = cell - new_h
+    pad_w = cell - new_w
+    top = pad_h // 2
+    left = pad_w // 2
+    padded = torch.nn.functional.pad(resized, (left, pad_w - left, top, pad_h - top))  # (C,cell,cell)
+    return padded.unsqueeze(0).unsqueeze(2)  # (1,C,1,cell,cell)
+
+
+def _build_reference_grid(references: list[torch.Tensor], target_width: int) -> torch.Tensor:
+    """Tile reference images into a compact near-square grid sized to ``target_width``.
+
+    All references are arranged in a ``rows`` x ``cols`` grid (``cols = ceil(sqrt(n))``), each in
+    an aspect-preserved square cell, then the whole grid is resized so its width equals
+    ``target_width``. This keeps the condition montage aligned with the generated-image column
+    width (better space utilization) instead of one overly-long row.
+
+    Args:
+        references: list of single-frame pixel tensors (each (1,C,1,H,W) or (C,H,W)), in [-1, 1].
+        target_width: width of the generated/target image for this sample.
+
+    Returns:
+        A (1, C, 1, H_grid, target_width) tensor.
+    """
+    if not references:
+        raise ValueError("Expected at least one reference image to build the condition grid.")
+
+    refs = [_pixel_tensor_to_5d(r) for r in references]  # list[(1,C,1,H,W)]
+    n = len(refs)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    cell = max(1, target_width // cols)
+
+    cells = [_resize_pad_to_square(r, cell) for r in refs]  # list[(1,C,1,cell,cell)]
+    blank = torch.zeros_like(cells[0])
+    while len(cells) < rows * cols:
+        cells.append(blank)
+
+    row_imgs = []
+    for r in range(rows):
+        row = torch.cat(cells[r * cols : (r + 1) * cols], dim=-1)  # (1,C,1,cell,cols*cell)
+        row_imgs.append(row)
+    grid = torch.cat(row_imgs, dim=-2)  # (1,C,1,rows*cell,cols*cell)
+
+    return _resize_5d_to_width(grid, target_width)  # (1,C,1,H_grid,target_width)
 
 
 class EveryNDrawSample(EveryN):
@@ -425,6 +554,7 @@ class EveryNDrawSample(EveryN):
         model: Any,
         data_batch: dict[str, Any],
         raw_data: list[torch.Tensor] | None,
+        x0: list[torch.Tensor] | None,
         metadata: MultiviewTransferMetadata,
         iteration: int,
         tag: str,
@@ -439,6 +569,16 @@ class EveryNDrawSample(EveryN):
             gt_target_video.float().cpu(),  # [V,C,F,H,W]
         ]
 
+        # IMPORTANT: run diffusion generation BEFORE any auxiliary VAE decode.
+        # generate_samples_from_batch drives the compiled net under
+        # torch.compiler.cudagraph_mark_step_begin(); interposing a large VAE
+        # decode (e.g. the clean-x0 reconstruction row below) between the
+        # previous cudagraph step and the sampler perturbs the captured cudagraph
+        # memory pool and collapses the generated latents to ~undenoised noise.
+        # Decoding the clean x0 AFTER sampling (matching the standard single-item
+        # sample() path ordering) keeps generation bit-for-bit as in the runs that
+        # produced good zero-shot output.
+        generated_rows: list[torch.Tensor] = []
         generation_batch = slice_data_batch(data_batch, start=0, limit=1)
         for guidance in self.guidance:
             sample = model.generate_samples_from_batch(
@@ -453,7 +593,15 @@ class EveryNDrawSample(EveryN):
             if len(sample_vision) != 1:
                 return MultiviewTransferSampleResult(handled=True)
             assert hasattr(model, "decode")
-            generated_video = model.decode(sample_vision[0])  # [1,C,V*F,H,W] or [C,V*F,H,W]
+            if "enable_per_camera_vae_encoding" in data_batch:
+                generated_video = _decode_multiview_latent_per_view(  # [1,C,V*F,H,W] or [C,V*F,H,W]
+                    model,
+                    sample_vision[0],
+                    metadata.sample_n_views,
+                    metadata.num_video_frames_per_view,
+                )
+            else:
+                generated_video = model.decode(sample_vision[0])  # [1,C,V*F,H,W] or [C,V*F,H,W]
             generated_by_view = _split_multiview_tensor_by_view(
                 generated_video,
                 metadata.sample_n_views,
@@ -461,7 +609,36 @@ class EveryNDrawSample(EveryN):
             )  # [V,C,F,H,W] or None
             if generated_by_view is None:
                 return MultiviewTransferSampleResult(handled=True)
-            to_show.append(generated_by_view.float().cpu())  # [V,C,F,H,W]
+            generated_rows.append(generated_by_view.float().cpu())  # [V,C,F,H,W]
+
+        # VAE reconstruction of the clean target latent (decode of the x0 tokens). This is the
+        # tokenizer reconstruction ceiling — the best the model could produce if generation were
+        # perfect — so it isolates VAE loss from diffusion generation quality. Decoded only after
+        # generation completes (see note above). Kept as row 3 (before the generated rows) so the
+        # display order stays [control, GT, clean recon, generated].
+        if x0 is not None and len(x0) >= metadata.num_vision_items:
+            assert hasattr(model, "decode")
+            clean_target_latent = x0[metadata.num_vision_items - 1]  # [1,C,V*T_latent,H,W] or [C,V*T_latent,H,W]
+            if "enable_per_camera_vae_encoding" in data_batch:
+                clean_target_decoded = _decode_multiview_latent_per_view(  # [1,C,V*F,H,W] or [C,V*F,H,W]
+                    model,
+                    clean_target_latent,
+                    metadata.sample_n_views,
+                    metadata.num_video_frames_per_view,
+                )
+            else:
+                clean_target_decoded = model.decode(  # [1,C,V*F,H,W] or [C,V*F,H,W]
+                    clean_target_latent
+                )
+            clean_target_by_view = _split_multiview_tensor_by_view(
+                clean_target_decoded,
+                metadata.sample_n_views,
+                metadata.num_video_frames_per_view,
+            )  # [V,C,F,H,W] or None
+            if clean_target_by_view is not None:
+                to_show.append(clean_target_by_view.float().cpu())
+
+        to_show.extend(generated_rows)
 
         if any(row.shape != to_show[0].shape for row in to_show):
             return MultiviewTransferSampleResult(handled=True)
@@ -516,6 +693,7 @@ class EveryNDrawSample(EveryN):
                 model,
                 data_batch,
                 raw_data,
+                x0,
                 multiview_metadata,
                 iteration,
                 tag,
@@ -528,14 +706,28 @@ class EveryNDrawSample(EveryN):
             # Split into per-sample condition (source) and GT target images.
             condition_images: list[torch.Tensor] = []
             gt_target_images: list[torch.Tensor] = []
+            gt_target_latents: list[torch.Tensor] = []
             vis_offset = 0
             for sample_idx in range(data_clean.batch_size):
                 n_vis = num_items[sample_idx]
-                # First item(s) are condition, last item is generation target
-                # but we need to support multiple conditions per sample in the future. Current code
-                # can handle this without throwing an error.
-                condition_images.append(raw_data[vis_offset])  # source image (1, C, 1, H, W)
-                gt_target_images.append(raw_data[vis_offset + n_vis - 1])  # target image (1, C, 1, H, W)
+                # First item(s) are condition references, last item is the generation target.
+                refs = raw_data[vis_offset : vis_offset + n_vis - 1]  # all condition items
+                target = raw_data[vis_offset + n_vis - 1]  # target image (1, C, 1, H, W)
+                # Multi-reference generation (>1 single-frame image references): tile every
+                # reference into a compact grid resized to the target width, so all references
+                # are visible without blowing up the row width. For video editing/transfer
+                # (T > 1) keep the existing behavior (first item = condition) so those tasks
+                # render exactly as before and stay consistent with the t_crop frame cropping.
+                refs_are_images = all(r.shape[-3] == 1 for r in refs) and target.shape[-3] == 1
+                if refs_are_images and len(refs) > 1:
+                    condition_images.append(_build_reference_grid(refs, target.shape[-1]))
+                else:
+                    condition_images.append(raw_data[vis_offset])  # source image (1, C, 1, H, W) / video clip
+                gt_target_images.append(target)
+                # x0 (clean vision latents) can be None when the model/training setup does not
+                # populate x0_tokens_vision; only collect target latents when they are available.
+                if x0 is not None:
+                    gt_target_latents.append(x0[vis_offset + n_vis - 1])  # target latent (1, C, 1, H, W)
                 vis_offset += n_vis
 
             # Use target images for max_w/max_h/t_crop (generated samples match target size)
@@ -567,6 +759,19 @@ class EveryNDrawSample(EveryN):
             sample_vision_decoded = [model.decode(sample_vision_i) for sample_vision_i in sample_vision]
             assert len(sample_vision_decoded) == n_viz_sample
             to_show.append(pad_images_and_cat(sample_vision_decoded, max_w, max_h, t_crop).float().cpu())
+
+        # Penultimate row: VAE reconstruction of the clean latents (decode of the x0 tokens).
+        # This is the tokenizer reconstruction ceiling — how much detail is lost by encode+decode
+        # alone — so it separates VAE loss from the diffusion model's generation quality.
+        # x0 (clean vision latents) can be None when the model/training setup does not populate
+        # x0_tokens_vision; skip the clean-recon row entirely in that case.
+        if x0 is not None:
+            assert hasattr(model, "decode")
+            if is_multi_item:
+                clean_token_decoded = [model.decode(latent) for latent in gt_target_latents]
+            else:
+                clean_token_decoded = [model.decode(latent) for latent in x0[:n_viz_sample]]
+            to_show.append(pad_images_and_cat(clean_token_decoded, max_w, max_h, t_crop).float().cpu())
 
         # Last row: ground truth
         if is_multi_item:
