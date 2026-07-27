@@ -160,6 +160,40 @@ python -m cosmos_framework.scripts.inspect_action_policy_onnx \
 未知 rank 会单独记录；在缺少 `value_info` 时，不能把未知 rank 当作
 四维以下。
 
+## 受限后端图改写
+
+对固定 DROID layout 执行部署改写，不修改 PyTorch forward：
+
+```bash
+python -m cosmos_framework.scripts.rewrite_action_policy_onnx \
+  outputs/onnx/edge_policy.onnx \
+  outputs/onnx/edge_policy.compatible.onnx
+```
+
+脚本会：
+
+- 将 unary `Einsum` 改为 `Transpose`；
+- 将 `ConstantOfShape` 改为标量 initializer + `Expand`；
+- 折叠常量 `Gather`，将常量标量 `Gather` 改为 `Slice + Squeeze`；
+- 将可证明为 axis-0 固定索引布局的 `ScatterElements` 改为 `ScatterND`；
+- 将 causal `Trilu + Where` 改为固定 causal bias + `Add`；
+- 将 `action_domain_id` 固定为 DROID domain ID 8；
+- 将 `prompt_token_ids` 输入替换为 `prompt_embeddings`，并导出原始
+  embedding 表 `.npy` sidecar。
+
+改写输出必须与输入 ONNX 位于同一目录，确保原 external-data 相对引用仍然有效。
+脚本只处理满足已知结构并能检查前置条件的 pattern，结束后运行
+`onnx.checker` 和兼容性审计；目标算子仍有残留时返回错误。
+
+等价性边界：
+
+- `Einsum`、`ConstantOfShape`、常量/标量 `Gather` 和已验证索引布局的
+  `ScatterElements` 为局部严格等价；
+- domain 改写只对固定 `droid_lerobot`（ID 8）部署等价；
+- 宿主端必须使用导出的 embedding 表，根据 token ID 生成
+  `[108, 2048]` 的 `prompt_embeddings`；
+- additive causal bias 要求 mask 前 attention score 为有限值。
+
 ## 当前状态和首次验证清单
 
 当前版本是在无 PyTorch、无 CUDA、无 checkpoint 的外网代码机上完成的初版，只通过语法和静态检查，尚未声称端到端导出成功。在内网首次运行时必须完成：
