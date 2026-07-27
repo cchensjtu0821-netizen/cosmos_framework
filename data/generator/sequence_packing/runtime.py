@@ -250,8 +250,15 @@ def sequence_pack_from_packed_sequence(
     """
     del packed_gen_token_indexes
 
-    non_causal_text_idxs = _find_non_causal_text_token_idx(attn_modes, split_lens, packed_und_token_indexes.tolist())
-    assert len(non_causal_text_idxs) == 0, "non_causal_text_idxs should be empty"
+    # This is an eager-only metadata invariant check. During torch.export /
+    # torch.compile capture, ``tolist()`` produces symbolic integers that
+    # cannot be hashed by ``_find_non_causal_text_token_idx``. The check does
+    # not contribute to the model output, so keep it out of the captured graph.
+    if not torch.compiler.is_compiling():
+        non_causal_text_idxs = _find_non_causal_text_token_idx(
+            attn_modes, split_lens, packed_und_token_indexes.tolist()
+        )
+        assert len(non_causal_text_idxs) == 0, "non_causal_text_idxs should be empty"
 
     assert sum(sample_lens) == packed_sequence.shape[0], (
         "sum(sample_lens) must be equal to the length of the packed sequence"
