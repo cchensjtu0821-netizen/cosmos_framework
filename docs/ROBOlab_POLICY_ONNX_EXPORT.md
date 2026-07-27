@@ -128,6 +128,38 @@ python -m cosmos_framework.scripts.export_action_policy_onnx \
 cosmos3_policy_denoiser.onnx.json
 ```
 
+## 部署兼容性检查
+
+检查指定不支持算子，以及任一输入或输出 rank 大于 4 的节点：
+
+```bash
+python -m cosmos_framework.scripts.inspect_action_policy_onnx \
+  outputs/onnx/cosmos3_policy_denoiser.simplified.onnx
+```
+
+默认检查 `ConstantOfShape`、`Einsum`、`Gather`、
+`ScatterElements` 和 `Where`，并生成：
+
+```text
+cosmos3_policy_denoiser.simplified.onnx.compatibility.json
+```
+
+可追加自定义算子、改变最大 rank，或在 CI 中发现问题时返回非零：
+
+```bash
+python -m cosmos_framework.scripts.inspect_action_policy_onnx \
+  outputs/onnx/cosmos3_policy_denoiser.simplified.onnx \
+  --target-op Trilu \
+  --target-op GatherND \
+  --target-op ScatterND \
+  --max-rank 4 \
+  --fail-on-findings
+```
+
+检查器使用 `load_external_data=False`，不会把多 GB 外部权重载入内存。
+未知 rank 会单独记录；在缺少 `value_info` 时，不能把未知 rank 当作
+四维以下。
+
 ## 当前状态和首次验证清单
 
 当前版本是在无 PyTorch、无 CUDA、无 checkpoint 的外网代码机上完成的初版，只通过语法和静态检查，尚未声称端到端导出成功。在内网首次运行时必须完成：
