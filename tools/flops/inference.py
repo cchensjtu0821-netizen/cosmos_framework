@@ -32,7 +32,7 @@ def _descriptor(net: Any):
         latent_patch_size=int(getattr(net_cfg, "latent_patch_size", 2)),
         latent_channel_size=int(getattr(net_cfg, "latent_channel_size", 48)),
         action_dim=int(getattr(net_cfg, "action_dim", 32)),
-        sound_dim=int(getattr(net_cfg, "sound_dim", 64)),
+        sound_dim=int(getattr(net_cfg, "sound_dim", None) or 64),
         frequency_embedding_size=int(getattr(net_cfg, "frequency_embedding_size", 256)),
         predict_text_tokens=bool(getattr(net_cfg, "predict_text_tokens", False)),
     )
