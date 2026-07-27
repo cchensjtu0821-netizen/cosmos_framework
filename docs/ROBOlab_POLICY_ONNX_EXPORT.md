@@ -49,6 +49,7 @@ lowering 的自定义 CUDA 算子。该替换只作用于导出模型，不改�
 - 可正常运行 Cosmos3-Nano-Policy-DROID 推理的 CUDA 环境；
 - PyTorch 及项目完整依赖；
 - `onnx`；
+- `onnxsim`（默认执行图简化，可用 `--no-simplify-onnx` 关闭）；
 - PyTorch dynamo ONNX exporter 所需依赖（通常包含 `onnxscript`）。
 
 建议额外安装 `onnxruntime-gpu`，用于后续数值对比。
@@ -78,6 +79,27 @@ python -m cosmos_framework.scripts.export_action_policy_onnx \
   --checkpoint-path /实际模型路径 \
   --output-path outputs/onnx/cosmos3_policy_denoiser.onnx \
   --no-verify-onnx
+```
+
+默认还会保留原始 ONNX，并额外生成：
+
+```text
+cosmos3_policy_denoiser.simplified.onnx
+cosmos3_policy_denoiser.simplified.onnx.data
+```
+
+可指定简化模型路径或关闭简化：
+
+```bash
+python -m cosmos_framework.scripts.export_action_policy_onnx \
+  --checkpoint-path /实际模型路径 \
+  --output-path outputs/onnx/cosmos3_policy_denoiser.onnx \
+  --simplified-output-path outputs/onnx/cosmos3_policy_denoiser.deploy.onnx
+
+python -m cosmos_framework.scripts.export_action_policy_onnx \
+  --checkpoint-path /实际模型路径 \
+  --output-path outputs/onnx/cosmos3_policy_denoiser.onnx \
+  --no-simplify-onnx
 ```
 
 ## ONNX 输入输出

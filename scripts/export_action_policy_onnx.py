@@ -50,6 +50,8 @@ class ExportArgs(pydantic.BaseModel):
     domain_name: str = "droid_lerobot"
     opset_version: int = 18
     verify_onnx: bool = True
+    simplify_onnx: bool = True
+    simplified_output_path: Path | None = None
     export_report: bool = True
 
 
@@ -167,6 +169,34 @@ def _shape_manifest(names: tuple[str, ...], tensors: tuple[torch.Tensor, ...]) -
     }
 
 
+def _simplified_output_path(args: ExportArgs) -> Path:
+    if args.simplified_output_path is not None:
+        return args.simplified_output_path
+    return args.output_path.with_name(f"{args.output_path.stem}.simplified{args.output_path.suffix}")
+
+
+def _simplify_onnx(source_path: Path, output_path: Path) -> None:
+    try:
+        import onnx
+        import onnxsim
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Install `onnxsim` to simplify the exported ONNX model") from exc
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    simplified_model, check_ok = onnxsim.simplify(str(source_path))
+    if not check_ok:
+        raise RuntimeError("onnxsim numerical validation failed")
+    onnx.save_model(
+        simplified_model,
+        str(output_path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=f"{output_path.name}.data",
+        size_threshold=1024,
+    )
+    onnx.checker.check_model(str(output_path))
+
+
 def export_action_policy_onnx(args: ExportArgs) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("The Cosmos3 Policy exporter requires a CUDA environment")
@@ -238,14 +268,24 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
     manifest_path = args.output_path.with_suffix(args.output_path.suffix + ".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
 
-    if args.verify_onnx:
+    if args.verify_onnx or args.simplify_onnx:
         try:
             import onnx
         except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError("Install `onnx` to run structural verification") from exc
+            raise ModuleNotFoundError("Install `onnx` to verify or simplify the exported model") from exc
+
+    if args.verify_onnx:
         onnx.checker.check_model(str(args.output_path))
 
+    simplified_path = None
+    if args.simplify_onnx:
+        simplified_path = _simplified_output_path(args)
+        print(f"Simplifying ONNX to: {simplified_path}")
+        _simplify_onnx(args.output_path, simplified_path)
+
     print(f"ONNX saved to: {args.output_path}")
+    if simplified_path is not None:
+        print(f"Simplified ONNX saved to: {simplified_path}")
     print(f"Shape manifest saved to: {manifest_path}")
 
 
