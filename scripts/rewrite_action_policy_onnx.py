@@ -966,8 +966,10 @@ def _verify_rewrite_equivalence(
     )
 
     rewritten_inputs: dict[str, np.ndarray] = {}
-    rewritten_names = {value.name for value in rewritten_session.get_inputs()}
-    for name in rewritten_names:
+    rewritten_input_meta = {
+        value.name: value for value in rewritten_session.get_inputs()
+    }
+    for name, rewritten_value in rewritten_input_meta.items():
         if name == "prompt_embeddings":
             embeddings = original_inputs.get(name)
             if embeddings is None:
@@ -977,7 +979,15 @@ def _verify_rewrite_equivalence(
             video = original_inputs[name]
             if video.ndim != 5 or video.shape[0] != 1:
                 raise ValueError(f"Expected original video_latent [1,C,T,H,W], got {video.shape}")
-            rewritten_inputs[name] = video[0]
+            expected_shape = _fixed_ort_shape(rewritten_value)
+            if len(expected_shape) == 5:
+                rewritten_inputs[name] = video
+            elif len(expected_shape) == 4:
+                rewritten_inputs[name] = video[0]
+            else:
+                raise ValueError(
+                    f"Expected rewritten video_latent rank 4 or 5, got {expected_shape}"
+                )
         elif name in original_inputs:
             rewritten_inputs[name] = original_inputs[name]
         else:
