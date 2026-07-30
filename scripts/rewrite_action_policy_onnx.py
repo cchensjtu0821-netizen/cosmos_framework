@@ -773,16 +773,41 @@ def _rewrite_causal_where_safe(
         scores_name = node.input[2]
         bias = np.where(condition.astype(bool), fill, np.asarray(0, dtype=fill_value.dtype))
         bias_name = _add_initializer(graph, _unique_name(graph, f"{node.output[0]}_causal_bias"), bias, onnx)
+        score_dtype = np.dtype(fill_value.dtype)
+        if not np.issubdtype(score_dtype, np.floating):
+            continue
+        limits = np.finfo(score_dtype)
+        clip_min = _add_initializer(
+            graph,
+            _unique_name(graph, f"{node.output[0]}_finite_min"),
+            np.asarray(limits.min, dtype=score_dtype),
+            onnx,
+        )
+        clip_max = _add_initializer(
+            graph,
+            _unique_name(graph, f"{node.output[0]}_finite_max"),
+            np.asarray(limits.max, dtype=score_dtype),
+            onnx,
+        )
+        clipped_scores = _unique_name(graph, f"{node.output[0]}_finite_scores")
         old_name = node.name
+        clip_node = onnx.helper.make_node(
+            "Clip",
+            [scores_name, clip_min, clip_max],
+            [clipped_scores],
+            name=f"{old_name}_clip_finite_scores",
+        )
+        insert_at = list(graph.node).index(node)
+        graph.node.insert(insert_at, clip_node)
         node.op_type = "Add"
         node.name = old_name.replace("masked_fill", "causal_add") if old_name else old_name
         del node.input[:]
-        node.input.extend([scores_name, bias_name])
+        node.input.extend([clipped_scores, bias_name])
         changes.append(
             {
                 "kind": "finite_input_equivalent",
                 "node": old_name,
-                "rewrite": "Trilu+Where->Add(causal_bias)",
+                "rewrite": "Trilu+Where->Clip(finite scores)+Add(causal_bias)",
                 "requirement": "Attention scores must be finite before masking.",
             }
         )
