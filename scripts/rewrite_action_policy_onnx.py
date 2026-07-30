@@ -1048,6 +1048,7 @@ def _apply_rewrites(
     prompt_embedding_table_path: Path,
     onnx: Any,
     lower_vision_ranks: bool,
+    keep_causal_where: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
     changes: list[dict[str, Any]] = []
     _freeze_action_domain(graph, domain_id, onnx, changes)
@@ -1071,7 +1072,9 @@ def _apply_rewrites(
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
         "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
         "scatter_elements": _rewrite_scatter_elements(graph, evaluator, onnx, changes),
-        "causal_where": _rewrite_causal_where_safe(graph, evaluator, onnx, changes),
+        "causal_where": (
+            0 if keep_causal_where else _rewrite_causal_where_safe(graph, evaluator, onnx, changes)
+        ),
     }
     counts["nd_indices"] = _normalize_nd_indices(graph, onnx, changes)
     _prune_unused(graph)
@@ -1114,6 +1117,7 @@ def rewrite_model(
     verification_seed: int = 0,
     verification_atol: float = 1e-2,
     verification_rtol: float = 1e-2,
+    keep_causal_where: bool = False,
 ) -> dict[str, Any]:
     try:
         import onnx
@@ -1131,6 +1135,7 @@ def rewrite_model(
         prompt_embedding_table_path=prompt_embedding_table_path,
         onnx=onnx,
         lower_vision_ranks=True,
+        keep_causal_where=keep_causal_where,
     )
     onnx.save_model(model, str(output_path))
     onnx.checker.check_model(str(output_path))
@@ -1178,6 +1183,7 @@ def rewrite_model(
         "output_path": str(output_path.resolve()),
         "prompt_embedding_table_path": str(prompt_embedding_table_path.resolve()),
         "domain_id": domain_id,
+        "diagnostic_keep_causal_where": keep_causal_where,
         "counts": counts,
         "remaining_target_nodes": remaining,
         "remaining_high_rank_nodes": remaining_high_rank_nodes,
@@ -1218,6 +1224,14 @@ def main() -> None:
     parser.add_argument("--verification-seed", type=int, default=0)
     parser.add_argument("--verification-atol", type=float, default=1e-2)
     parser.add_argument("--verification-rtol", type=float, default=1e-2)
+    parser.add_argument(
+        "--keep-causal-where",
+        action="store_true",
+        help=(
+            "Diagnostic mode: retain causal Where nodes while applying all other rewrites. "
+            "The output is not target-compatible while Where remains."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.input_path.is_file():
@@ -1238,6 +1252,7 @@ def main() -> None:
         verification_seed=args.verification_seed,
         verification_atol=args.verification_atol,
         verification_rtol=args.verification_rtol,
+        keep_causal_where=args.keep_causal_where,
     )
     report_path = args.report_path or args.output_path.with_suffix(args.output_path.suffix + ".rewrite.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -1259,13 +1274,21 @@ def main() -> None:
                 f"max_abs_error={metrics['max_abs_error']:.8g} "
                 f"mean_abs_error={metrics['mean_abs_error']}"
             )
+    if args.keep_causal_where:
+        print(
+            "Diagnostic mode: causal Where nodes were retained; "
+            "this output is not target-compatible."
+        )
+    op_counts = report["compatibility_summary"]["op_counts"]
+    blocking_target_nodes = report["remaining_target_nodes"]
+    if args.keep_causal_where:
+        blocking_target_nodes -= op_counts.get("Where", 0)
     if (
-        report["remaining_target_nodes"]
+        blocking_target_nodes
         or report["remaining_high_rank_nodes"]
         or report["remaining_high_rank_graph_io"]
         or (report["verification"]["enabled"] and not report["verification"]["allclose"])
     ):
-        op_counts = report["compatibility_summary"]["op_counts"]
         remaining_counts = {op: op_counts.get(op, 0) for op in DEFAULT_TARGET_OPS}
         raise RuntimeError(
             f"Rewritten model still has {report['remaining_target_nodes']} target nodes "
