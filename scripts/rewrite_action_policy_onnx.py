@@ -1049,6 +1049,7 @@ def _apply_rewrites(
     onnx: Any,
     lower_vision_ranks: bool,
     keep_causal_where: bool = False,
+    keep_scatter_elements: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
     changes: list[dict[str, Any]] = []
     _freeze_action_domain(graph, domain_id, onnx, changes)
@@ -1071,7 +1072,9 @@ def _apply_rewrites(
         "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
         "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
-        "scatter_elements": _rewrite_scatter_elements(graph, evaluator, onnx, changes),
+        "scatter_elements": (
+            0 if keep_scatter_elements else _rewrite_scatter_elements(graph, evaluator, onnx, changes)
+        ),
         "causal_where": (
             0 if keep_causal_where else _rewrite_causal_where_safe(graph, evaluator, onnx, changes)
         ),
@@ -1118,6 +1121,8 @@ def rewrite_model(
     verification_atol: float = 1e-2,
     verification_rtol: float = 1e-2,
     keep_causal_where: bool = False,
+    keep_vision_ranks: bool = False,
+    keep_scatter_elements: bool = False,
 ) -> dict[str, Any]:
     try:
         import onnx
@@ -1134,8 +1139,9 @@ def rewrite_model(
         domain_id=domain_id,
         prompt_embedding_table_path=prompt_embedding_table_path,
         onnx=onnx,
-        lower_vision_ranks=True,
+        lower_vision_ranks=not keep_vision_ranks,
         keep_causal_where=keep_causal_where,
+        keep_scatter_elements=keep_scatter_elements,
     )
     onnx.save_model(model, str(output_path))
     onnx.checker.check_model(str(output_path))
@@ -1184,6 +1190,8 @@ def rewrite_model(
         "prompt_embedding_table_path": str(prompt_embedding_table_path.resolve()),
         "domain_id": domain_id,
         "diagnostic_keep_causal_where": keep_causal_where,
+        "diagnostic_keep_vision_ranks": keep_vision_ranks,
+        "diagnostic_keep_scatter_elements": keep_scatter_elements,
         "counts": counts,
         "remaining_target_nodes": remaining,
         "remaining_high_rank_nodes": remaining_high_rank_nodes,
@@ -1232,6 +1240,19 @@ def main() -> None:
             "The output is not target-compatible while Where remains."
         ),
     )
+    parser.add_argument(
+        "--keep-vision-ranks",
+        action="store_true",
+        help=(
+            "Diagnostic mode: retain rank-5 vision I/O and rank-6 patch layouts "
+            "while applying other rewrites."
+        ),
+    )
+    parser.add_argument(
+        "--keep-scatter-elements",
+        action="store_true",
+        help="Diagnostic mode: retain ScatterElements nodes while applying other rewrites.",
+    )
     args = parser.parse_args()
 
     if not args.input_path.is_file():
@@ -1253,6 +1274,8 @@ def main() -> None:
         verification_atol=args.verification_atol,
         verification_rtol=args.verification_rtol,
         keep_causal_where=args.keep_causal_where,
+        keep_vision_ranks=args.keep_vision_ranks,
+        keep_scatter_elements=args.keep_scatter_elements,
     )
     report_path = args.report_path or args.output_path.with_suffix(args.output_path.suffix + ".rewrite.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -1279,14 +1302,32 @@ def main() -> None:
             "Diagnostic mode: causal Where nodes were retained; "
             "this output is not target-compatible."
         )
+    if args.keep_vision_ranks:
+        print(
+            "Diagnostic mode: high-rank vision layouts were retained; "
+            "this output is not target-compatible."
+        )
+    if args.keep_scatter_elements:
+        print(
+            "Diagnostic mode: ScatterElements nodes were retained; "
+            "this output is not target-compatible."
+        )
     op_counts = report["compatibility_summary"]["op_counts"]
     blocking_target_nodes = report["remaining_target_nodes"]
     if args.keep_causal_where:
         blocking_target_nodes -= op_counts.get("Where", 0)
+    if args.keep_scatter_elements:
+        blocking_target_nodes -= op_counts.get("ScatterElements", 0)
+    blocking_high_rank_nodes = (
+        0 if args.keep_vision_ranks else report["remaining_high_rank_nodes"]
+    )
+    blocking_high_rank_graph_io = (
+        0 if args.keep_vision_ranks else report["remaining_high_rank_graph_io"]
+    )
     if (
         blocking_target_nodes
-        or report["remaining_high_rank_nodes"]
-        or report["remaining_high_rank_graph_io"]
+        or blocking_high_rank_nodes
+        or blocking_high_rank_graph_io
         or (report["verification"]["enabled"] and not report["verification"]["allclose"])
     ):
         remaining_counts = {op: op_counts.get(op, 0) for op in DEFAULT_TARGET_OPS}
