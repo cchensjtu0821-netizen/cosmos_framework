@@ -924,8 +924,6 @@ def _verify_rewrite_equivalence(
         "allclose": all_close,
         "outputs": output_metrics,
     }
-    if not all_close:
-        raise RuntimeError(f"Original and rewritten ONNX outputs are not equivalent: {result}")
     return result
 
 
@@ -1074,13 +1072,15 @@ def main() -> None:
         report["remaining_target_nodes"]
         or report["remaining_high_rank_nodes"]
         or report["remaining_high_rank_graph_io"]
+        or (report["verification"]["enabled"] and not report["verification"]["allclose"])
     ):
         op_counts = report["compatibility_summary"]["op_counts"]
         remaining_counts = {op: op_counts.get(op, 0) for op in DEFAULT_TARGET_OPS}
         raise RuntimeError(
             f"Rewritten model still has {report['remaining_target_nodes']} target nodes "
             f"{remaining_counts}, {report['remaining_high_rank_nodes']} high-rank nodes, and "
-            f"{report['remaining_high_rank_graph_io']} high-rank graph I/O tensors. "
+            f"{report['remaining_high_rank_graph_io']} high-rank graph I/O tensors; "
+            f"equivalence_allclose={report['verification'].get('allclose', 'not-run')}. "
             f"See {report_path}."
         )
 
