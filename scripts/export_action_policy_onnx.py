@@ -21,7 +21,7 @@ init_script()
 import copy
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pydantic
@@ -48,6 +48,8 @@ class ExportArgs(pydantic.BaseModel):
     conditioning_fps: float = 15.0
     resolution: str | None = "480"
     domain_name: str = "droid_lerobot"
+    export_dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    """Floating-point dtype for the exported denoiser weights, inputs, and outputs."""
     opset_version: int = 18
     verify_onnx: bool = True
     simplify_onnx: bool = True
@@ -151,6 +153,12 @@ def _example_inputs(packed: Any) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _cast_export_inputs(inputs: tuple[torch.Tensor, ...], export_dtype: str) -> tuple[torch.Tensor, ...]:
+    if export_dtype == "bfloat16":
+        return inputs
+    return tuple(tensor.to(dtype=torch.float32) if tensor.is_floating_point() else tensor for tensor in inputs)
+
+
 def _install_onnx_attention(net: torch.nn.Module) -> int:
     replaced = 0
     for module in net.modules():
@@ -167,6 +175,28 @@ def _shape_manifest(names: tuple[str, ...], tensors: tuple[torch.Tensor, ...]) -
         name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "device": str(tensor.device)}
         for name, tensor in zip(names, tensors)
     }
+
+
+def _verify_float32_onnx(model_path: Path, onnx: Any) -> dict[str, int]:
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    forbidden = {
+        onnx.TensorProto.FLOAT16: "float16",
+        onnx.TensorProto.BFLOAT16: "bfloat16",
+    }
+    counts = {name: 0 for name in forbidden.values()}
+    offenders: list[str] = []
+    for initializer in model.graph.initializer:
+        dtype_name = forbidden.get(initializer.data_type)
+        if dtype_name is not None:
+            counts[dtype_name] += 1
+            offenders.append(f"{initializer.name}:{dtype_name}")
+    if offenders:
+        preview = ", ".join(offenders[:20])
+        suffix = f" (+{len(offenders) - 20} more)" if len(offenders) > 20 else ""
+        raise RuntimeError(
+            f"Float32 export still contains {len(offenders)} FP16/BF16 initializers: {preview}{suffix}"
+        )
+    return counts
 
 
 def _simplified_output_path(args: ExportArgs) -> Path:
@@ -221,8 +251,10 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
     replaced_attention_modules = _install_onnx_attention(service.model.net)
     print(f"Using ONNX dense attention in {replaced_attention_modules} module(s)")
 
+    export_dtype = torch.float32 if args.export_dtype == "float32" else torch.bfloat16
+    service.model.net.to(dtype=export_dtype)
     wrapper = PolicyDenoiserOnnxWrapper(service.model.net, packed).eval()
-    inputs = _example_inputs(packed)
+    inputs = _cast_export_inputs(_example_inputs(packed), args.export_dtype)
     input_names = (
         "prompt_token_ids",
         "video_latent",
@@ -262,6 +294,7 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
             "conditioning_fps": args.conditioning_fps,
             "resolution": args.resolution,
             "domain_name": args.domain_name,
+            "export_dtype": args.export_dtype,
             "opset_version": args.opset_version,
         },
     }
@@ -276,6 +309,9 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
 
     if args.verify_onnx:
         onnx.checker.check_model(str(args.output_path))
+        if args.export_dtype == "float32":
+            dtype_counts = _verify_float32_onnx(args.output_path, onnx)
+            print(f"Verified float32 ONNX initializers: forbidden dtype counts={dtype_counts}")
 
     simplified_path = None
     if args.simplify_onnx:
