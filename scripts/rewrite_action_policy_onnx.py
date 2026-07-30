@@ -1032,6 +1032,30 @@ def _apply_rewrites(
     return counts, changes
 
 
+def _prepare_verification_reference(
+    input_path: Path,
+    graph: Any,
+    *,
+    domain_id: int,
+    prompt_embedding_table_path: Path,
+    onnx: Any,
+) -> list[dict[str, Any]]:
+    """Align graph interfaces while preserving the original compute graph.
+
+    ONNX Runtime requires int64 GatherND/ScatterND indices and unique diagnostic
+    node names. Those changes are exact and do not replace any target backend
+    operator, so the resulting graph remains a useful reference for all actual
+    compatibility rewrites.
+    """
+    changes: list[dict[str, Any]] = []
+    _freeze_action_domain(graph, domain_id, onnx, changes)
+    _externalize_prompt_embedding(input_path, graph, prompt_embedding_table_path, onnx, changes)
+    _normalize_nd_indices(graph, onnx, changes)
+    _prune_unused(graph)
+    _deduplicate_node_names(graph)
+    return changes
+
+
 def rewrite_model(
     input_path: Path,
     output_path: Path,
@@ -1069,13 +1093,12 @@ def rewrite_model(
     if verify_equivalence:
         reference_path = output_path.with_name(f"{output_path.stem}.verification_reference{output_path.suffix}")
         reference_model = onnx.load_model(str(input_path), load_external_data=False)
-        _apply_rewrites(
+        _prepare_verification_reference(
             input_path,
             reference_model.graph,
             domain_id=domain_id,
             prompt_embedding_table_path=prompt_embedding_table_path,
             onnx=onnx,
-            lower_vision_ranks=False,
         )
         onnx.save_model(reference_model, str(reference_path))
         onnx.checker.check_model(str(reference_path))
@@ -1092,8 +1115,8 @@ def rewrite_model(
             )
             verification["reference_model"] = str(reference_path.resolve())
             verification["reference_scope"] = (
-                "Original graph with exact backend-compatibility rewrites, "
-                "retaining rank-5 vision I/O and rank-6 patch layouts."
+                "Original compute graph with only fixed-interface alignment, "
+                "ORT-required ND index casts, pruning, and unique node names."
             )
             verification_completed = True
         finally:
