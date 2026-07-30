@@ -371,18 +371,28 @@ def _rewrite_scatter_elements(
             if expand_node is None or expand_node.op_type != "Expand" or not expand_node.input:
                 continue
             candidate_name = expand_node.input[0]
-            unsqueeze_node = producers.get(candidate_name)
-            if unsqueeze_node is None or unsqueeze_node.op_type != "Unsqueeze" or not unsqueeze_node.input:
-                continue
-            axes = (
-                evaluator.evaluate(unsqueeze_node.input[1])
-                if len(unsqueeze_node.input) > 1
-                else np.asarray(_attribute(unsqueeze_node, "axes", onnx, []), dtype=np.int64)
-            )
-            if axes is None or axes.size != 1 or int(axes.reshape(-1)[0]) not in (1, -1):
-                continue
-            compact_name = candidate_name
-            rewrite = "ScatterElements(axis=0, expanded row indices)->ScatterND"
+            candidate_value = evaluator.evaluate(candidate_name)
+            if candidate_value is not None and candidate_value.ndim == 2 and candidate_value.shape[1] == 1:
+                compact_name = _add_initializer(
+                    graph,
+                    _unique_name(graph, f"{node.output[0]}_scatternd_indices"),
+                    candidate_value.astype(np.int64),
+                    onnx,
+                )
+                rewrite = "ScatterElements(axis=0, expanded constant row indices)->ScatterND"
+            else:
+                unsqueeze_node = producers.get(candidate_name)
+                if unsqueeze_node is None or unsqueeze_node.op_type != "Unsqueeze" or not unsqueeze_node.input:
+                    continue
+                axes = (
+                    evaluator.evaluate(unsqueeze_node.input[1])
+                    if len(unsqueeze_node.input) > 1
+                    else np.asarray(_attribute(unsqueeze_node, "axes", onnx, []), dtype=np.int64)
+                )
+                if axes is None or axes.size != 1 or int(axes.reshape(-1)[0]) not in (1, -1):
+                    continue
+                compact_name = candidate_name
+                rewrite = "ScatterElements(axis=0, expanded row indices)->ScatterND"
 
         old_name = node.name
         node.op_type = "ScatterND"
@@ -951,14 +961,23 @@ def _verify_rewrite_equivalence(
             )
         original_fp32 = comparable_original.astype(np.float32)
         rewritten_fp32 = rewritten.astype(np.float32)
+        original_finite = np.isfinite(original_fp32)
+        rewritten_finite = np.isfinite(rewritten_fp32)
+        original_nonfinite_count = int(original_fp32.size - np.count_nonzero(original_finite))
+        rewritten_nonfinite_count = int(rewritten_fp32.size - np.count_nonzero(rewritten_finite))
+        finite = original_nonfinite_count == 0 and rewritten_nonfinite_count == 0
         difference = np.abs(original_fp32 - rewritten_fp32)
-        close = bool(np.allclose(original_fp32, rewritten_fp32, atol=atol, rtol=rtol, equal_nan=True))
+        finite_difference = difference[np.isfinite(difference)]
+        close = finite and bool(np.allclose(original_fp32, rewritten_fp32, atol=atol, rtol=rtol))
         all_close &= close
         output_metrics[name] = {
             "original_shape": list(original.shape),
             "rewritten_shape": list(rewritten.shape),
-            "max_abs_error": float(difference.max(initial=0.0)),
-            "mean_abs_error": float(difference.mean()) if difference.size else 0.0,
+            "original_nonfinite_count": original_nonfinite_count,
+            "rewritten_nonfinite_count": rewritten_nonfinite_count,
+            "finite": finite,
+            "max_abs_error": float(finite_difference.max(initial=0.0)),
+            "mean_abs_error": float(finite_difference.mean()) if finite_difference.size else None,
             "allclose": close,
         }
 
@@ -993,12 +1012,14 @@ def _apply_rewrites(
             if lower_vision_ranks
             else 0
         ),
+        # The dynamo exporter emits these fixed permutations as unary Einsum,
+        # while the rank-lowering matcher operates on the equivalent Transpose.
+        "einsum": _rewrite_unary_einsum(graph, onnx, changes),
         "rank6_patchify": (
             _rewrite_patchify_rank6(graph, evaluator, onnx, changes)
             if lower_vision_ranks
             else 0
         ),
-        "einsum": _rewrite_unary_einsum(graph, onnx, changes),
         "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
         "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
@@ -1161,8 +1182,11 @@ def main() -> None:
         for name, metrics in report["verification"]["outputs"].items():
             print(
                 f"  {name}: allclose={metrics['allclose']} "
+                f"finite={metrics['finite']} "
+                f"nonfinite=({metrics['original_nonfinite_count']},"
+                f"{metrics['rewritten_nonfinite_count']}) "
                 f"max_abs_error={metrics['max_abs_error']:.8g} "
-                f"mean_abs_error={metrics['mean_abs_error']:.8g}"
+                f"mean_abs_error={metrics['mean_abs_error']}"
             )
     if (
         report["remaining_target_nodes"]
