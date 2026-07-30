@@ -867,13 +867,29 @@ def _fixed_ort_shape(value: Any) -> tuple[int, ...]:
     return tuple(int(dim) for dim in shape)
 
 
-def _make_verification_inputs(session: Any, *, domain_id: int, seed: int) -> dict[str, np.ndarray]:
+def _make_verification_inputs(
+    session: Any,
+    *,
+    domain_id: int,
+    seed: int,
+    prompt_embedding_table_path: Path,
+) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     inputs: dict[str, np.ndarray] = {}
     for value in session.get_inputs():
         shape = _fixed_ort_shape(value)
         dtype = _ort_input_dtype(value.type)
-        if value.name == "prompt_token_ids":
+        if value.name == "prompt_embeddings":
+            table = np.load(prompt_embedding_table_path, mmap_mode="r")
+            if table.ndim != 2 or len(shape) != 2 or table.shape[1] != shape[1]:
+                raise ValueError(
+                    "Prompt embedding table/input shape mismatch: "
+                    f"table={table.shape}, input={shape}"
+                )
+            # The pre-externalization verifier used all-zero prompt token IDs.
+            # Repeating table row zero preserves that exact valid interface.
+            inputs[value.name] = np.broadcast_to(table[0], shape).astype(dtype, copy=True)
+        elif value.name == "prompt_token_ids":
             inputs[value.name] = np.zeros(shape, dtype=dtype)
         elif value.name == "action_domain_id":
             inputs[value.name] = np.full(shape, domain_id, dtype=dtype)
@@ -891,6 +907,7 @@ def _verify_rewrite_equivalence(
     output_path: Path,
     *,
     domain_id: int,
+    prompt_embedding_table_path: Path,
     providers: list[str] | None,
     seed: int,
     atol: float,
@@ -916,7 +933,12 @@ def _verify_rewrite_equivalence(
 
     original_session = ort.InferenceSession(str(reference_path), providers=requested)
     rewritten_session = ort.InferenceSession(str(output_path), providers=requested)
-    original_inputs = _make_verification_inputs(original_session, domain_id=domain_id, seed=seed)
+    original_inputs = _make_verification_inputs(
+        original_session,
+        domain_id=domain_id,
+        seed=seed,
+        prompt_embedding_table_path=prompt_embedding_table_path,
+    )
 
     rewritten_inputs: dict[str, np.ndarray] = {}
     rewritten_names = {value.name for value in rewritten_session.get_inputs()}
@@ -1108,6 +1130,7 @@ def rewrite_model(
                 reference_path,
                 output_path,
                 domain_id=domain_id,
+                prompt_embedding_table_path=prompt_embedding_table_path,
                 providers=verification_providers,
                 seed=verification_seed,
                 atol=verification_atol,
