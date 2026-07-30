@@ -403,6 +403,36 @@ def _rewrite_scatter_elements(
     return count
 
 
+def _normalize_gathernd_indices(graph: Any, onnx: Any, changes: list[dict[str, Any]]) -> int:
+    """Cast GatherND indices to the int64 type required by ONNX Runtime."""
+    count = 0
+    for node in list(graph.node):
+        if node.op_type != "GatherND" or len(node.input) < 2:
+            continue
+        original_indices = node.input[1]
+        cast_output = _unique_name(graph, f"{node.output[0]}_gathernd_indices_int64")
+        cast_node = onnx.helper.make_node(
+            "Cast",
+            [original_indices],
+            [cast_output],
+            name=f"{node.name}_indices_int64",
+            to=onnx.TensorProto.INT64,
+        )
+        insert_at = list(graph.node).index(node)
+        graph.node.insert(insert_at, cast_node)
+        node.input[1] = cast_output
+        changes.append(
+            {
+                "kind": "exact",
+                "node": node.name,
+                "rewrite": "GatherND indices->int64",
+                "original_indices": original_indices,
+            }
+        )
+        count += 1
+    return count
+
+
 def _replace_node(graph: Any, old_nodes: list[Any], new_nodes: list[Any]) -> None:
     indexes = [list(graph.node).index(node) for node in old_nodes]
     insert_at = min(indexes)
@@ -971,6 +1001,7 @@ def _apply_rewrites(
         "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
         "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
+        "gathernd_indices": _normalize_gathernd_indices(graph, onnx, changes),
         "scatter_elements": _rewrite_scatter_elements(graph, evaluator, onnx, changes),
         "causal_where": _rewrite_causal_where_safe(graph, evaluator, onnx, changes),
     }
@@ -1026,6 +1057,7 @@ def rewrite_model(
         )
         onnx.save_model(reference_model, str(reference_path))
         onnx.checker.check_model(str(reference_path))
+        verification_completed = False
         try:
             verification = _verify_rewrite_equivalence(
                 reference_path,
@@ -1041,8 +1073,10 @@ def rewrite_model(
                 "Original graph with exact backend-compatibility rewrites, "
                 "retaining rank-5 vision I/O and rank-6 patch layouts."
             )
+            verification_completed = True
         finally:
-            reference_path.unlink(missing_ok=True)
+            if verification_completed:
+                reference_path.unlink(missing_ok=True)
     remaining = compatibility["summary"]["target_node_count"]
     remaining_high_rank_nodes = compatibility["summary"]["high_rank_node_count"]
     remaining_high_rank_graph_io = compatibility["summary"]["high_rank_graph_io_count"]
