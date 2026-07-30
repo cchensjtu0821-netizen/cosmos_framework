@@ -828,9 +828,8 @@ def _make_verification_inputs(session: Any, *, domain_id: int, seed: int) -> dic
 
 
 def _verify_rewrite_equivalence(
-    input_path: Path,
+    reference_path: Path,
     output_path: Path,
-    prompt_embedding_table_path: Path,
     *,
     domain_id: int,
     providers: list[str] | None,
@@ -856,7 +855,7 @@ def _verify_rewrite_equivalence(
             f"available={sorted(available)}"
         )
 
-    original_session = ort.InferenceSession(str(input_path), providers=requested)
+    original_session = ort.InferenceSession(str(reference_path), providers=requested)
     rewritten_session = ort.InferenceSession(str(output_path), providers=requested)
     original_inputs = _make_verification_inputs(original_session, domain_id=domain_id, seed=seed)
 
@@ -864,11 +863,10 @@ def _verify_rewrite_equivalence(
     rewritten_names = {value.name for value in rewritten_session.get_inputs()}
     for name in rewritten_names:
         if name == "prompt_embeddings":
-            token_ids = original_inputs.get("prompt_token_ids")
-            if token_ids is None:
-                raise ValueError("Original graph has no prompt_token_ids input required to build prompt_embeddings")
-            embedding_table = np.load(prompt_embedding_table_path, allow_pickle=False)
-            rewritten_inputs[name] = embedding_table[token_ids]
+            embeddings = original_inputs.get(name)
+            if embeddings is None:
+                raise ValueError("Verification reference graph has no prompt_embeddings input")
+            rewritten_inputs[name] = embeddings
         elif name == "video_latent":
             video = original_inputs[name]
             if video.ndim != 5 or video.shape[0] != 1:
@@ -927,6 +925,41 @@ def _verify_rewrite_equivalence(
     return result
 
 
+def _apply_rewrites(
+    input_path: Path,
+    graph: Any,
+    *,
+    domain_id: int,
+    prompt_embedding_table_path: Path,
+    onnx: Any,
+    lower_vision_ranks: bool,
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    changes: list[dict[str, Any]] = []
+    _freeze_action_domain(graph, domain_id, onnx, changes)
+    _externalize_prompt_embedding(input_path, graph, prompt_embedding_table_path, onnx, changes)
+    evaluator = ConstantEvaluator(input_path, graph, onnx)
+    counts = {
+        "fixed_vision_batch_io": (
+            _rewrite_fixed_vision_batch_io(graph, evaluator, onnx, changes)
+            if lower_vision_ranks
+            else 0
+        ),
+        "rank6_patchify": (
+            _rewrite_patchify_rank6(graph, evaluator, onnx, changes)
+            if lower_vision_ranks
+            else 0
+        ),
+        "einsum": _rewrite_unary_einsum(graph, onnx, changes),
+        "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
+        "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
+        "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
+        "scatter_elements": _rewrite_scatter_elements(graph, evaluator, onnx, changes),
+        "causal_where": _rewrite_causal_where_safe(graph, evaluator, onnx, changes),
+    }
+    _prune_unused(graph)
+    return counts, changes
+
+
 def rewrite_model(
     input_path: Path,
     output_path: Path,
@@ -948,40 +981,49 @@ def rewrite_model(
         raise ValueError("Input and output must share a directory so existing external-data references remain valid")
     model = onnx.load_model(str(input_path), load_external_data=False)
     graph = model.graph
-    changes: list[dict[str, Any]] = []
-
-    _freeze_action_domain(graph, domain_id, onnx, changes)
-    _externalize_prompt_embedding(input_path, graph, prompt_embedding_table_path, onnx, changes)
-    evaluator = ConstantEvaluator(input_path, graph, onnx)
-    counts = {
-        "fixed_vision_batch_io": _rewrite_fixed_vision_batch_io(graph, evaluator, onnx, changes),
-        "rank6_patchify": _rewrite_patchify_rank6(graph, evaluator, onnx, changes),
-        "einsum": _rewrite_unary_einsum(graph, onnx, changes),
-        "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
-        "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
-        "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
-        "scatter_elements": _rewrite_scatter_elements(graph, evaluator, onnx, changes),
-        "causal_where": _rewrite_causal_where_safe(graph, evaluator, onnx, changes),
-    }
-    _prune_unused(graph)
+    counts, changes = _apply_rewrites(
+        input_path,
+        graph,
+        domain_id=domain_id,
+        prompt_embedding_table_path=prompt_embedding_table_path,
+        onnx=onnx,
+        lower_vision_ranks=True,
+    )
     onnx.save_model(model, str(output_path))
     onnx.checker.check_model(str(output_path))
 
     compatibility = inspect_model(output_path, DEFAULT_TARGET_OPS, max_rank=4)
-    verification = (
-        _verify_rewrite_equivalence(
+    verification: dict[str, Any] = {"enabled": False}
+    if verify_equivalence:
+        reference_path = output_path.with_name(f"{output_path.stem}.verification_reference{output_path.suffix}")
+        reference_model = onnx.load_model(str(input_path), load_external_data=False)
+        _apply_rewrites(
             input_path,
-            output_path,
-            prompt_embedding_table_path,
+            reference_model.graph,
             domain_id=domain_id,
-            providers=verification_providers,
-            seed=verification_seed,
-            atol=verification_atol,
-            rtol=verification_rtol,
+            prompt_embedding_table_path=prompt_embedding_table_path,
+            onnx=onnx,
+            lower_vision_ranks=False,
         )
-        if verify_equivalence
-        else {"enabled": False}
-    )
+        onnx.save_model(reference_model, str(reference_path))
+        onnx.checker.check_model(str(reference_path))
+        try:
+            verification = _verify_rewrite_equivalence(
+                reference_path,
+                output_path,
+                domain_id=domain_id,
+                providers=verification_providers,
+                seed=verification_seed,
+                atol=verification_atol,
+                rtol=verification_rtol,
+            )
+            verification["reference_model"] = str(reference_path.resolve())
+            verification["reference_scope"] = (
+                "Original graph with exact backend-compatibility rewrites, "
+                "retaining rank-5 vision I/O and rank-6 patch layouts."
+            )
+        finally:
+            reference_path.unlink(missing_ok=True)
     remaining = compatibility["summary"]["target_node_count"]
     remaining_high_rank_nodes = compatibility["summary"]["high_rank_node_count"]
     remaining_high_rank_graph_io = compatibility["summary"]["high_rank_graph_io_count"]
