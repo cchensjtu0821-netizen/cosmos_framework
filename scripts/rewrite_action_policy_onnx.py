@@ -781,6 +781,24 @@ def _prune_unused(graph: Any) -> None:
     graph.value_info.extend(kept_value_info)
 
 
+def _deduplicate_node_names(graph: Any) -> int:
+    """Make diagnostic node names unique without changing graph semantics."""
+    used: set[str] = set()
+    renamed = 0
+    for index, node in enumerate(graph.node):
+        base = node.name or f"node_{index}"
+        candidate = base
+        suffix = 1
+        while candidate in used:
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        if node.name != candidate:
+            node.name = candidate
+            renamed += 1
+        used.add(candidate)
+    return renamed
+
+
 def _ort_input_dtype(type_name: str) -> Any:
     mapping = {
         "tensor(float)": np.float32,
@@ -957,6 +975,7 @@ def _apply_rewrites(
         "causal_where": _rewrite_causal_where_safe(graph, evaluator, onnx, changes),
     }
     _prune_unused(graph)
+    counts["deduplicated_node_names"] = _deduplicate_node_names(graph)
     return counts, changes
 
 
