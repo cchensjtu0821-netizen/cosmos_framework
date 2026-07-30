@@ -601,6 +601,15 @@ class RobolabPolicyService:
         with profiler.cpu("build_sample"):
             sample = self._build_sample(obs)
             profiler.add_flops("build_sample", 0)
+            profiler.record_shape(
+                "policy_sample",
+                {
+                    "observation_image": obs.get("observation/image"),
+                    "video": sample.get("video"),
+                    "action": sample.get("action"),
+                    "history_action": sample.get("history_action"),
+                },
+            )
         with profiler.cpu("build_batch"):
             data_batch = _build_data_batch_from_sample(sample)
             seed = self._next_seed()
@@ -639,6 +648,13 @@ class RobolabPolicyService:
                 quat_xyzw = convert_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
                 action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
             profiler.add_flops("action_postprocess", 0)
+            profiler.record_shape(
+                "policy_action_output",
+                {
+                    "model_action": samples.get("action"),
+                    "returned_action": action_np,
+                },
+            )
 
         outputs: dict[str, Any] = {"action": action_np}
         if self.cfg.decode_video:

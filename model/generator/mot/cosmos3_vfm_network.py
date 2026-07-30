@@ -20,7 +20,7 @@ from cosmos_framework.model.generator.utils.memory import MemoryState
 from cosmos_framework.data.generator.sequence_packing import ModalityData, PackedSequence
 from cosmos_framework.data.generator.sequence_packing.natten import verify_natten_parameter_list
 from cosmos_framework.tools.flops.inference import compute_policy_forward_flops
-from cosmos_framework.utils.module_profiler import profile_cuda, profile_flops
+from cosmos_framework.utils.module_profiler import profile_cuda, profile_flops, profile_shape
 
 
 class Cosmos3VFMNetworkConfig(PretrainedConfig):
@@ -929,6 +929,17 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             if getattr(self, "_module_profiler", None) is not None
             else {}
         )
+        profile_shape(
+            self,
+            "vfm_input",
+            {
+                "text_ids": packed_seq.text_ids,
+                "vision_tokens": packed_seq.vision.tokens if packed_seq.vision is not None else None,
+                "action_tokens": packed_seq.action.tokens if packed_seq.action is not None else None,
+                "vision_timesteps": packed_seq.vision.timesteps if packed_seq.vision is not None else None,
+                "action_timesteps": packed_seq.action.timesteps if packed_seq.action is not None else None,
+            },
+        )
 
         with profile_cuda(self, "encode_text"):
             packed_sequence, target_dtype = self._encode_text(packed_seq)  # packed_sequence: [N_total,hidden_size]
@@ -1101,6 +1112,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             packed_outputs=packed_outputs,
             parallel_dims=sequence_shard_parallel_dims,
         )  # [N_total,hidden_size]
+        profile_shape(self, "mot_hidden", {"input_pack": input_pack, "last_hidden_state": last_hidden_state})
         output_dict = dict()
 
         # decode vision tokens
@@ -1130,6 +1142,15 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             )  # [N_ce_tokens,vocab_size]
             output_dict["ce_preds"] = packed_ce_preds
 
+        profile_shape(
+            self,
+            "vfm_output",
+            {
+                "preds_vision": output_dict.get("preds_vision"),
+                "preds_action": output_dict.get("preds_action"),
+                "preds_sound": output_dict.get("preds_sound"),
+            },
+        )
         return output_dict
 
 

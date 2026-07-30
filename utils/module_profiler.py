@@ -14,6 +14,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator
 
+import numpy as np
 import torch
 
 
@@ -26,6 +27,7 @@ class ModuleProfiler:
         self._cuda_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._counters: dict[str, int] = defaultdict(int)
         self._flops: dict[str, int] = defaultdict(int)
+        self._shapes: dict[str, dict[str, Any]] = {}
         self._active_regions: list[str] = []
         self._finalized = False
 
@@ -75,6 +77,40 @@ class ModuleProfiler:
                 self._flops[region] += value
 
     @staticmethod
+    def _describe_shape(value: Any) -> Any:
+        """Return a JSON-serializable shape/dtype description without reading tensor data."""
+        if isinstance(value, torch.Tensor):
+            return {"shape": list(value.shape), "dtype": str(value.dtype), "device": str(value.device)}
+        if isinstance(value, np.ndarray):
+            return {"shape": list(value.shape), "dtype": str(value.dtype), "device": "cpu"}
+        if isinstance(value, dict):
+            return {str(key): ModuleProfiler._describe_shape(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [ModuleProfiler._describe_shape(item) for item in value]
+        if value is None:
+            return None
+        return {"type": type(value).__name__}
+
+    def record_shape(self, name: str, value: Any) -> None:
+        """Record one key tensor structure and count repeated observations of the same shape."""
+        if not self.enabled:
+            return
+        description = self._describe_shape(value)
+        existing = self._shapes.get(name)
+        if existing is None:
+            self._shapes[name] = {"count": 1, "value": description}
+            return
+        if existing["value"] == description:
+            existing["count"] += 1
+            return
+        variants = existing.setdefault("variants", [])
+        for variant in variants:
+            if variant["value"] == description:
+                variant["count"] += 1
+                return
+        variants.append({"count": 1, "value": description})
+
+    @staticmethod
     def _summary(samples: list[float]) -> dict[str, float | int]:
         return {
             "count": len(samples),
@@ -114,6 +150,7 @@ class ModuleProfiler:
                 name: {"total": value, "tflops": value / 1e12}
                 for name, value in self._flops.items()
             },
+            "shapes": self._shapes,
             "memory": memory,
         }
 
@@ -138,3 +175,9 @@ def profile_flops(owner: Any, name: str, value: int) -> None:
     profiler = getattr(owner, "_module_profiler", None)
     if profiler is not None:
         profiler.add_flops(name, value)
+
+
+def profile_shape(owner: Any, name: str, value: Any) -> None:
+    profiler = getattr(owner, "_module_profiler", None)
+    if profiler is not None:
+        profiler.record_shape(name, value)

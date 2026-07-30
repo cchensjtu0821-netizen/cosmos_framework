@@ -24,7 +24,13 @@ from cosmos_framework.utils import log, misc
 from cosmos_framework.utils.count_params import count_params
 from cosmos_framework.utils.timer import Timer
 from cosmos_framework.tools.flops.wan_vae import compute_wan_vae_encoder_flops
-from cosmos_framework.utils.module_profiler import profile_cpu, profile_cuda, profile_flops, profile_increment
+from cosmos_framework.utils.module_profiler import (
+    profile_cpu,
+    profile_cuda,
+    profile_flops,
+    profile_increment,
+    profile_shape,
+)
 from cosmos_framework.model.generator.algorithm.loss.flow_matching import compute_flow_matching_loss
 from cosmos_framework.model.generator.algorithm.loss.load_balancing import compute_load_balancing_loss
 from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
@@ -1991,6 +1997,22 @@ class OmniMoTModel(ImaginaireModel):
             condition_reference.append(torch.cat(condition_reference_parts, dim=0))  # [N_tokens_flat]
             condition_mask.append(torch.cat(condition_mask_parts, dim=0))  # [N_tokens_flat]
 
+        if getattr(self, "_module_profiler", None) is not None:
+            profile_shape(
+                self,
+                "prepare_inference",
+                {
+                    "vision_x0": gen_data_clean.x0_tokens_vision,
+                    "action_x0": gen_data_clean.x0_tokens_action,
+                    "cond_text_token_ids": [torch.empty(len(tokens), dtype=torch.int64) for tokens in cond_text_tokens],
+                    "uncond_text_token_ids": [
+                        torch.empty(len(tokens), dtype=torch.int64) for tokens in uncond_text_tokens
+                    ],
+                    "initial_noise": initial_noise,
+                    "condition_reference": condition_reference,
+                    "condition_mask": condition_mask,
+                },
+            )
         return (
             sequence_plans,
             gen_data_clean,
@@ -2126,6 +2148,7 @@ class OmniMoTModel(ImaginaireModel):
             concatenated vision (and optionally action) velocity
         """
         n_samples = len(noise_x)
+        profile_shape(self, "velocity_input", {"joint_noise": noise_x, "timestep": timestep})
         is_image_batch = gen_data_clean.is_image_batch
         has_action = self.config.action_gen and any(plan.has_action for plan in sequence_plans)
         if has_noisy_actions and not has_action:
@@ -2339,6 +2362,15 @@ class OmniMoTModel(ImaginaireModel):
 
             velocity_output.append(torch.cat(parts, dim=0))  # [N_tokens_flat]
 
+        profile_shape(
+            self,
+            "velocity_output",
+            {
+                "vision_velocity": velocity_vision,
+                "action_velocity": velocity_action,
+                "joint_velocity": velocity_output,
+            },
+        )
         return velocity_output
 
     def _remove_padding_from_latent(

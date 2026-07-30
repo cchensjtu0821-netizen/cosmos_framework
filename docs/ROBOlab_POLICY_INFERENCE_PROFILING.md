@@ -5,9 +5,27 @@
 - 启用参数：`--enable-module-profile`。
 - 输出文件：`<profile-output-dir>/module_profile.jsonl`。
 - `cpu`、`cuda` 保留原有耗时统计；新增 `flops`，每项包含整数 `total` 和 `tflops`。
+- 同一条 JSONL 记录中的 `shapes` 保存该请求关键位置的实际 tensor
+  shape、dtype、device；相同 shape 在 sampler/CFG 中重复出现时只保存一次并增加
+  `count`，避免按去噪步数复制大段元数据。
 - 理论 FLOPs 采用一次乘加等于 2 FLOPs；按请求的实际 token 数、packed sequence 和模型配置计算。
 - 子模块 FLOPs 自动向其活动中的父区间汇总，因此总量与分项是包含关系，不能把所有层级直接相加。
 - FLOPs 是理论运算量，不是硬件计数器值；CUDA kernel 融合、稀疏执行、通信、访存和 CPU 操作不会等价反映在 FLOPs 中。
+
+示例启动参数：
+
+```bash
+python -m cosmos_framework.scripts.action_policy_server_robolab \
+  --checkpoint-path /path/to/Cosmos3-Nano-Policy-DROID \
+  --enable-module-profile \
+  --profile-every-n 1 \
+  --profile-output-dir /tmp/cosmos3_action_profile \
+  --torch-profiler-request 4
+```
+
+每个被选中的请求会追加一条
+`/tmp/cosmos3_action_profile/module_profile.jsonl`；第 4 个请求还会额外生成
+PyTorch operator trace 和按 CUDA self time 排序的摘要。
 
 ## Cosmos Policy 推理流程
 
@@ -96,8 +114,43 @@ WebSocket observation
     "conditional_forward_calls": 4,
     "unconditional_forward_calls": 4
   },
+  "shapes": {
+    "policy_sample": {
+      "count": 1,
+      "value": {
+        "video": {"shape": [3, 33, 544, 736], "dtype": "torch.uint8", "device": "cpu"},
+        "action": {"shape": [33, 64], "dtype": "torch.float32", "device": "cpu"}
+      }
+    },
+    "vfm_input": {
+      "count": 8,
+      "value": {
+        "text_ids": {"shape": [108], "dtype": "torch.int64", "device": "cuda:0"},
+        "vision_tokens": [
+          {"shape": [48, 9, 34, 46], "dtype": "torch.bfloat16", "device": "cuda:0"}
+        ],
+        "action_tokens": [
+          {"shape": [33, 64], "dtype": "torch.bfloat16", "device": "cuda:0"}
+        ]
+      }
+    }
+  },
   "memory": {"peak_allocated_mb": 12345.0}
 }
 ```
+
+上面的数值只是默认 DROID 配置示意；实际记录来自运行时 tensor，不依赖文档
+中的静态假设。主要 shape 节点为：
+
+| `shapes` 名称 | 记录内容 |
+|---|---|
+| `policy_sample` | observation image、transform 后 video/action/history action |
+| `prepare_inference` | VAE latent、模型 action、文本 token、联合初始噪声、条件 reference/mask |
+| `velocity_input` | 每次 sampler 调用的联合状态和 timestep |
+| `vfm_input` | 真正进入 VFM forward 的 text/vision/action 及各模态 timestep |
+| `mot_hidden` | MoT packed 输入与最后一层 hidden state |
+| `vfm_output` | VFM 的 vision/action/sound velocity |
+| `velocity_output` | mask 后的各模态 velocity 与重新拼接的联合 velocity |
+| `policy_action_output` | 模型内部 action 输出与服务最终返回 action |
 
 比较模块时应使用同一请求的实际 token 数、采样步数、guidance 和 decode-video 配置。耗时高但 FLOPs 低通常说明访存、CPU、同步或通信占主导；FLOPs 高但耗时没有同比增长通常来自更高的 GPU 利用率或 kernel 融合。
