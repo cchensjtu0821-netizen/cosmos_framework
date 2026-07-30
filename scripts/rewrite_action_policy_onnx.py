@@ -572,19 +572,10 @@ def _rewrite_patchify_rank6(
             channels, frames, patch_h_count, patch_h, patch_w_count, patch_w = first_shape
             block_size = patch_h
             channel_patch = channels * block_size * block_size
-            token_count = frames * patch_h_count * patch_w_count
             prefix = output_name
             to_nchw = _unique_name(graph, f"{prefix}_patchify_nchw")
             space_to_depth = _unique_name(graph, f"{prefix}_space_to_depth")
             channels_last = _unique_name(graph, f"{prefix}_patchify_channels_last")
-            channel_groups = _unique_name(graph, f"{prefix}_patchify_channel_groups")
-            patch_major = _unique_name(graph, f"{prefix}_patchify_patch_major")
-            grouped_shape = _add_initializer(
-                graph,
-                _unique_name(graph, f"{prefix}_patchify_grouped_shape"),
-                np.asarray([token_count, channels, block_size * block_size], dtype=np.int64),
-                onnx,
-            )
             final_shape_name = _add_initializer(
                 graph,
                 _unique_name(graph, f"{prefix}_patchify_final_shape"),
@@ -606,6 +597,8 @@ def _rewrite_patchify_rank6(
                     name=f"{first_reshape.name}_space_to_depth",
                     blocksize=block_size,
                 ),
+                # ONNX SpaceToDepth orders its depth axis as [p, q, C],
+                # exactly matching forward's "cthpwq->thwpqc".
                 onnx.helper.make_node(
                     "Transpose",
                     [space_to_depth],
@@ -615,21 +608,7 @@ def _rewrite_patchify_rank6(
                 ),
                 onnx.helper.make_node(
                     "Reshape",
-                    [channels_last, grouped_shape],
-                    [channel_groups],
-                    name=f"{first_reshape.name}_rank3_channel_groups",
-                    allowzero=1,
-                ),
-                onnx.helper.make_node(
-                    "Transpose",
-                    [channel_groups],
-                    [patch_major],
-                    name=f"{transpose.name}_rank3_patch_major",
-                    perm=[0, 2, 1],
-                ),
-                onnx.helper.make_node(
-                    "Reshape",
-                    [patch_major, final_shape_name],
+                    [channels_last, final_shape_name],
                     [output_name],
                     name=final_reshape.name,
                     allowzero=1,
@@ -667,19 +646,10 @@ def _rewrite_patchify_rank6(
         ):
             frames, patch_h_count, patch_w_count, patch_h, patch_w, channels = first_shape
             block_size = patch_h
-            token_count = frames * patch_h_count * patch_w_count
             prefix = output_name
-            grouped = _unique_name(graph, f"{prefix}_unpatchify_grouped")
-            channel_major = _unique_name(graph, f"{prefix}_unpatchify_channel_major")
             rank4_channels_last = _unique_name(graph, f"{prefix}_unpatchify_rank4_channels_last")
             nchw_patches = _unique_name(graph, f"{prefix}_unpatchify_nchw_patches")
             depth_to_space = _unique_name(graph, f"{prefix}_depth_to_space")
-            grouped_shape = _add_initializer(
-                graph,
-                _unique_name(graph, f"{prefix}_unpatchify_grouped_shape"),
-                np.asarray([token_count, block_size * block_size, channels], dtype=np.int64),
-                onnx,
-            )
             rank4_shape = _add_initializer(
                 graph,
                 _unique_name(graph, f"{prefix}_unpatchify_rank4_shape"),
@@ -692,21 +662,7 @@ def _rewrite_patchify_rank6(
             new_nodes = [
                 onnx.helper.make_node(
                     "Reshape",
-                    [source_name, grouped_shape],
-                    [grouped],
-                    name=f"{first_reshape.name}_rank3_patch_groups",
-                    allowzero=1,
-                ),
-                onnx.helper.make_node(
-                    "Transpose",
-                    [grouped],
-                    [channel_major],
-                    name=f"{transpose.name}_rank3_channel_major",
-                    perm=[0, 2, 1],
-                ),
-                onnx.helper.make_node(
-                    "Reshape",
-                    [channel_major, rank4_shape],
+                    [source_name, rank4_shape],
                     [rank4_channels_last],
                     name=f"{first_reshape.name}_rank4_channels_last",
                     allowzero=1,
@@ -724,6 +680,8 @@ def _rewrite_patchify_rank6(
                     [depth_to_space],
                     name=f"{final_reshape.name}_depth_to_space",
                     blocksize=block_size,
+                    # DCR consumes depth as [p, q, C], the exact inverse of
+                    # forward's "thwpqc->cthpwq".
                     mode="DCR",
                 ),
                 onnx.helper.make_node(
