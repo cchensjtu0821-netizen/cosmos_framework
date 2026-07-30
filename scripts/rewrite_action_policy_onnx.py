@@ -10,6 +10,8 @@ its serving forward path. It targets the exact patterns emitted by
 * ConstantOfShape -> scalar initializer + Expand
 * constant Gather -> initializer, scalar Gather -> Slice + Squeeze
 * supported axis-0 ScatterElements layouts -> ScatterND
+* fixed batch-1 vision I/O -> rank-4 vision I/O
+* fixed rank-6 vision patchify/unpatchify -> rank <= 4 space/depth layouts
 * causal Trilu + Where(mask, -inf, scores) -> Add(scores, causal_bias)
 * prompt token embedding Gather -> a ``prompt_embeddings`` graph input
 * fixed DROID action domain -> constant domain ID 8
@@ -401,6 +403,310 @@ def _rewrite_scatter_elements(
     return count
 
 
+def _replace_node(graph: Any, old_nodes: list[Any], new_nodes: list[Any]) -> None:
+    indexes = [list(graph.node).index(node) for node in old_nodes]
+    insert_at = min(indexes)
+    for node in old_nodes:
+        graph.node.remove(node)
+    for offset, node in enumerate(new_nodes):
+        graph.node.insert(insert_at + offset, node)
+
+
+def _rewrite_fixed_vision_batch_io(
+    graph: Any,
+    evaluator: ConstantEvaluator,
+    onnx: Any,
+    changes: list[dict[str, Any]],
+) -> int:
+    """Remove the fixed batch=1 axis from the exported vision input/output."""
+    count = 0
+
+    video_input = next((value for value in graph.input if value.name == "video_latent"), None)
+    if video_input is not None:
+        dims = video_input.type.tensor_type.shape.dim
+        consumers = [node for node in graph.node if "video_latent" in node.input]
+        if (
+            len(dims) == 5
+            and dims[0].HasField("dim_value")
+            and int(dims[0].dim_value) == 1
+            and len(consumers) == 1
+            and consumers[0].op_type == "Squeeze"
+            and len(consumers[0].input) > 1
+        ):
+            squeeze = consumers[0]
+            axes = evaluator.evaluate(squeeze.input[1])
+            if axes is not None and axes.size == 1 and int(axes.reshape(-1)[0]) == 0:
+                squeezed_name = squeeze.output[0]
+                for node in graph.node:
+                    if node is not squeeze:
+                        for index, input_name in enumerate(node.input):
+                            if input_name == squeezed_name:
+                                node.input[index] = "video_latent"
+                del dims[0]
+                graph.node.remove(squeeze)
+                changes.append(
+                    {
+                        "kind": "exact_for_fixed_configuration",
+                        "node": squeeze.name,
+                        "rewrite": "remove fixed batch=1 vision input Squeeze",
+                    }
+                )
+                count += 1
+
+    vision_output = next((value for value in graph.output if value.name == "vision_velocity"), None)
+    producer = _producer_map(graph).get("vision_velocity")
+    if vision_output is not None and producer is not None and producer.op_type == "Unsqueeze":
+        dims = vision_output.type.tensor_type.shape.dim
+        axes = evaluator.evaluate(producer.input[1]) if len(producer.input) > 1 else None
+        if (
+            len(dims) == 5
+            and dims[0].HasField("dim_value")
+            and int(dims[0].dim_value) == 1
+            and axes is not None
+            and axes.size == 1
+            and int(axes.reshape(-1)[0]) == 0
+        ):
+            source_name = producer.input[0]
+            del producer.attribute[:]
+            del producer.input[:]
+            producer.input.append(source_name)
+            producer.op_type = "Identity"
+            producer.name = producer.name.replace("unsqueeze", "identity")
+            del dims[0]
+            changes.append(
+                {
+                    "kind": "exact_for_fixed_configuration",
+                    "node": producer.name,
+                    "rewrite": "remove fixed batch=1 vision output Unsqueeze",
+                }
+            )
+            count += 1
+
+    return count
+
+
+def _rewrite_patchify_rank6(
+    graph: Any,
+    evaluator: ConstantEvaluator,
+    onnx: Any,
+    changes: list[dict[str, Any]],
+) -> int:
+    """Lower fixed 6-D vision patchify/unpatchify through rank <= 4 ops."""
+    producers = _producer_map(graph)
+    count = 0
+
+    for final_reshape in list(graph.node):
+        if final_reshape.op_type != "Reshape" or len(final_reshape.input) < 2:
+            continue
+        transpose = producers.get(final_reshape.input[0])
+        if transpose is None or transpose.op_type != "Transpose" or not transpose.input:
+            continue
+        first_reshape = producers.get(transpose.input[0])
+        if first_reshape is None or first_reshape.op_type != "Reshape" or len(first_reshape.input) < 2:
+            continue
+
+        first_shape_value = evaluator.evaluate(first_reshape.input[1])
+        final_shape_value = evaluator.evaluate(final_reshape.input[1])
+        if first_shape_value is None or final_shape_value is None:
+            continue
+        first_shape = tuple(int(value) for value in first_shape_value.reshape(-1))
+        final_shape = tuple(int(value) for value in final_shape_value.reshape(-1))
+        permutation = tuple(int(value) for value in _attribute(transpose, "perm", onnx, []))
+
+        source_name = first_reshape.input[0]
+        output_name = final_reshape.output[0]
+
+        # Patchify:
+        # [C,T,H*p,W*p] -> reshape [C,T,H,p,W,p]
+        # -> transpose [T,H,W,p,p,C] -> [T*H*W,p*p*C].
+        if (
+            len(first_shape) == 6
+            and len(final_shape) == 2
+            and permutation == (1, 2, 4, 3, 5, 0)
+            and first_shape[3] == first_shape[5]
+            and first_shape[3] > 0
+            and final_shape[0] == first_shape[1] * first_shape[2] * first_shape[4]
+            and final_shape[1] == first_shape[3] * first_shape[5] * first_shape[0]
+        ):
+            channels, frames, patch_h_count, patch_h, patch_w_count, patch_w = first_shape
+            block_size = patch_h
+            channel_patch = channels * block_size * block_size
+            token_count = frames * patch_h_count * patch_w_count
+            prefix = output_name
+            to_nchw = _unique_name(graph, f"{prefix}_patchify_nchw")
+            space_to_depth = _unique_name(graph, f"{prefix}_space_to_depth")
+            channels_last = _unique_name(graph, f"{prefix}_patchify_channels_last")
+            channel_groups = _unique_name(graph, f"{prefix}_patchify_channel_groups")
+            patch_major = _unique_name(graph, f"{prefix}_patchify_patch_major")
+            grouped_shape = _add_initializer(
+                graph,
+                _unique_name(graph, f"{prefix}_patchify_grouped_shape"),
+                np.asarray([token_count, channels, block_size * block_size], dtype=np.int64),
+                onnx,
+            )
+            final_shape_name = _add_initializer(
+                graph,
+                _unique_name(graph, f"{prefix}_patchify_final_shape"),
+                np.asarray(final_shape, dtype=np.int64),
+                onnx,
+            )
+            new_nodes = [
+                onnx.helper.make_node(
+                    "Transpose",
+                    [source_name],
+                    [to_nchw],
+                    name=f"{first_reshape.name}_rank4_transpose",
+                    perm=[1, 0, 2, 3],
+                ),
+                onnx.helper.make_node(
+                    "SpaceToDepth",
+                    [to_nchw],
+                    [space_to_depth],
+                    name=f"{first_reshape.name}_space_to_depth",
+                    blocksize=block_size,
+                ),
+                onnx.helper.make_node(
+                    "Transpose",
+                    [space_to_depth],
+                    [channels_last],
+                    name=f"{transpose.name}_rank4_channels_last",
+                    perm=[0, 2, 3, 1],
+                ),
+                onnx.helper.make_node(
+                    "Reshape",
+                    [channels_last, grouped_shape],
+                    [channel_groups],
+                    name=f"{first_reshape.name}_rank3_channel_groups",
+                    allowzero=1,
+                ),
+                onnx.helper.make_node(
+                    "Transpose",
+                    [channel_groups],
+                    [patch_major],
+                    name=f"{transpose.name}_rank3_patch_major",
+                    perm=[0, 2, 1],
+                ),
+                onnx.helper.make_node(
+                    "Reshape",
+                    [patch_major, final_shape_name],
+                    [output_name],
+                    name=final_reshape.name,
+                    allowzero=1,
+                ),
+            ]
+            _replace_node(graph, [first_reshape, transpose, final_reshape], new_nodes)
+            changes.append(
+                {
+                    "kind": "exact",
+                    "nodes": [first_reshape.name, transpose.name, final_reshape.name],
+                    "rewrite": "rank-6 patchify->rank<=4 SpaceToDepth pipeline",
+                    "block_size": block_size,
+                    "channel_patch": channel_patch,
+                }
+            )
+            count += 1
+            continue
+
+        # Unpatchify, the exact inverse:
+        # [T*H*W,p*p*C] -> reshape [T,H,W,p,p,C]
+        # -> transpose [C,T,H,p,W,p] -> [C,T,H*p,W*p].
+        if (
+            len(first_shape) == 6
+            and len(final_shape) == 4
+            and permutation == (5, 0, 1, 3, 2, 4)
+            and first_shape[3] == first_shape[4]
+            and first_shape[3] > 0
+            and final_shape
+            == (
+                first_shape[5],
+                first_shape[0],
+                first_shape[1] * first_shape[3],
+                first_shape[2] * first_shape[4],
+            )
+        ):
+            frames, patch_h_count, patch_w_count, patch_h, patch_w, channels = first_shape
+            block_size = patch_h
+            token_count = frames * patch_h_count * patch_w_count
+            prefix = output_name
+            grouped = _unique_name(graph, f"{prefix}_unpatchify_grouped")
+            channel_major = _unique_name(graph, f"{prefix}_unpatchify_channel_major")
+            rank4_channels_last = _unique_name(graph, f"{prefix}_unpatchify_rank4_channels_last")
+            nchw_patches = _unique_name(graph, f"{prefix}_unpatchify_nchw_patches")
+            depth_to_space = _unique_name(graph, f"{prefix}_depth_to_space")
+            grouped_shape = _add_initializer(
+                graph,
+                _unique_name(graph, f"{prefix}_unpatchify_grouped_shape"),
+                np.asarray([token_count, block_size * block_size, channels], dtype=np.int64),
+                onnx,
+            )
+            rank4_shape = _add_initializer(
+                graph,
+                _unique_name(graph, f"{prefix}_unpatchify_rank4_shape"),
+                np.asarray(
+                    [frames, patch_h_count, patch_w_count, channels * block_size * block_size],
+                    dtype=np.int64,
+                ),
+                onnx,
+            )
+            new_nodes = [
+                onnx.helper.make_node(
+                    "Reshape",
+                    [source_name, grouped_shape],
+                    [grouped],
+                    name=f"{first_reshape.name}_rank3_patch_groups",
+                    allowzero=1,
+                ),
+                onnx.helper.make_node(
+                    "Transpose",
+                    [grouped],
+                    [channel_major],
+                    name=f"{transpose.name}_rank3_channel_major",
+                    perm=[0, 2, 1],
+                ),
+                onnx.helper.make_node(
+                    "Reshape",
+                    [channel_major, rank4_shape],
+                    [rank4_channels_last],
+                    name=f"{first_reshape.name}_rank4_channels_last",
+                    allowzero=1,
+                ),
+                onnx.helper.make_node(
+                    "Transpose",
+                    [rank4_channels_last],
+                    [nchw_patches],
+                    name=f"{transpose.name}_rank4_nchw",
+                    perm=[0, 3, 1, 2],
+                ),
+                onnx.helper.make_node(
+                    "DepthToSpace",
+                    [nchw_patches],
+                    [depth_to_space],
+                    name=f"{final_reshape.name}_depth_to_space",
+                    blocksize=block_size,
+                    mode="DCR",
+                ),
+                onnx.helper.make_node(
+                    "Transpose",
+                    [depth_to_space],
+                    [output_name],
+                    name=final_reshape.name,
+                    perm=[1, 0, 2, 3],
+                ),
+            ]
+            _replace_node(graph, [first_reshape, transpose, final_reshape], new_nodes)
+            changes.append(
+                {
+                    "kind": "exact",
+                    "nodes": [first_reshape.name, transpose.name, final_reshape.name],
+                    "rewrite": "rank-6 unpatchify->rank<=4 DepthToSpace pipeline",
+                    "block_size": block_size,
+                }
+            )
+            count += 1
+
+    return count
+
+
 def _rewrite_causal_where_safe(
     graph: Any,
     evaluator: ConstantEvaluator,
@@ -475,12 +781,165 @@ def _prune_unused(graph: Any) -> None:
     graph.value_info.extend(kept_value_info)
 
 
+def _ort_input_dtype(type_name: str) -> Any:
+    mapping = {
+        "tensor(float)": np.float32,
+        "tensor(float16)": np.float16,
+        "tensor(double)": np.float64,
+        "tensor(int64)": np.int64,
+        "tensor(int32)": np.int32,
+        "tensor(bool)": np.bool_,
+    }
+    if type_name == "tensor(bfloat16)":
+        try:
+            import ml_dtypes
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("Install `ml_dtypes` to verify a BF16 ONNX model") from exc
+        return ml_dtypes.bfloat16
+    if type_name not in mapping:
+        raise TypeError(f"Unsupported ONNX Runtime verification input type: {type_name}")
+    return mapping[type_name]
+
+
+def _fixed_ort_shape(value: Any) -> tuple[int, ...]:
+    shape = value.shape
+    if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+        raise ValueError(f"Equivalence verification requires fixed positive input shape, got {value.name}: {shape}")
+    return tuple(int(dim) for dim in shape)
+
+
+def _make_verification_inputs(session: Any, *, domain_id: int, seed: int) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    inputs: dict[str, np.ndarray] = {}
+    for value in session.get_inputs():
+        shape = _fixed_ort_shape(value)
+        dtype = _ort_input_dtype(value.type)
+        if value.name == "prompt_token_ids":
+            inputs[value.name] = np.zeros(shape, dtype=dtype)
+        elif value.name == "action_domain_id":
+            inputs[value.name] = np.full(shape, domain_id, dtype=dtype)
+        elif "timestep" in value.name:
+            inputs[value.name] = np.full(shape, 0.5, dtype=dtype)
+        elif np.issubdtype(np.dtype(dtype), np.integer):
+            inputs[value.name] = np.zeros(shape, dtype=dtype)
+        else:
+            inputs[value.name] = rng.standard_normal(shape).astype(dtype)
+    return inputs
+
+
+def _verify_rewrite_equivalence(
+    input_path: Path,
+    output_path: Path,
+    prompt_embedding_table_path: Path,
+    *,
+    domain_id: int,
+    providers: list[str] | None,
+    seed: int,
+    atol: float,
+    rtol: float,
+) -> dict[str, Any]:
+    try:
+        import onnxruntime as ort
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Install `onnxruntime` or `onnxruntime-gpu` for equivalence verification") from exc
+
+    available = set(ort.get_available_providers())
+    requested = providers or (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if "CUDAExecutionProvider" in available
+        else ["CPUExecutionProvider"]
+    )
+    missing = [provider for provider in requested if provider not in available]
+    if missing:
+        raise RuntimeError(
+            f"Requested ONNX Runtime providers are unavailable: {missing}; "
+            f"available={sorted(available)}"
+        )
+
+    original_session = ort.InferenceSession(str(input_path), providers=requested)
+    rewritten_session = ort.InferenceSession(str(output_path), providers=requested)
+    original_inputs = _make_verification_inputs(original_session, domain_id=domain_id, seed=seed)
+
+    rewritten_inputs: dict[str, np.ndarray] = {}
+    rewritten_names = {value.name for value in rewritten_session.get_inputs()}
+    for name in rewritten_names:
+        if name == "prompt_embeddings":
+            token_ids = original_inputs.get("prompt_token_ids")
+            if token_ids is None:
+                raise ValueError("Original graph has no prompt_token_ids input required to build prompt_embeddings")
+            embedding_table = np.load(prompt_embedding_table_path, allow_pickle=False)
+            rewritten_inputs[name] = embedding_table[token_ids]
+        elif name == "video_latent":
+            video = original_inputs[name]
+            if video.ndim != 5 or video.shape[0] != 1:
+                raise ValueError(f"Expected original video_latent [1,C,T,H,W], got {video.shape}")
+            rewritten_inputs[name] = video[0]
+        elif name in original_inputs:
+            rewritten_inputs[name] = original_inputs[name]
+        else:
+            raise KeyError(f"Cannot map rewritten ONNX input {name!r} to the original graph")
+
+    original_names = [value.name for value in original_session.get_outputs()]
+    rewritten_names_ordered = [value.name for value in rewritten_session.get_outputs()]
+    original_outputs = dict(
+        zip(original_names, original_session.run(original_names, original_inputs))
+    )
+    rewritten_outputs = dict(
+        zip(rewritten_names_ordered, rewritten_session.run(rewritten_names_ordered, rewritten_inputs))
+    )
+
+    output_metrics: dict[str, Any] = {}
+    all_close = True
+    for name, original in original_outputs.items():
+        if name not in rewritten_outputs:
+            raise KeyError(f"Rewritten graph is missing output {name!r}")
+        rewritten = rewritten_outputs[name]
+        comparable_original = original
+        if original.ndim == rewritten.ndim + 1 and original.shape[0] == 1:
+            comparable_original = original[0]
+        if comparable_original.shape != rewritten.shape:
+            raise ValueError(
+                f"Output shape mismatch for {name}: original={original.shape}, "
+                f"comparable={comparable_original.shape}, rewritten={rewritten.shape}"
+            )
+        original_fp32 = comparable_original.astype(np.float32)
+        rewritten_fp32 = rewritten.astype(np.float32)
+        difference = np.abs(original_fp32 - rewritten_fp32)
+        close = bool(np.allclose(original_fp32, rewritten_fp32, atol=atol, rtol=rtol, equal_nan=True))
+        all_close &= close
+        output_metrics[name] = {
+            "original_shape": list(original.shape),
+            "rewritten_shape": list(rewritten.shape),
+            "max_abs_error": float(difference.max(initial=0.0)),
+            "mean_abs_error": float(difference.mean()) if difference.size else 0.0,
+            "allclose": close,
+        }
+
+    result = {
+        "enabled": True,
+        "providers": requested,
+        "seed": seed,
+        "atol": atol,
+        "rtol": rtol,
+        "allclose": all_close,
+        "outputs": output_metrics,
+    }
+    if not all_close:
+        raise RuntimeError(f"Original and rewritten ONNX outputs are not equivalent: {result}")
+    return result
+
+
 def rewrite_model(
     input_path: Path,
     output_path: Path,
     *,
     domain_id: int,
     prompt_embedding_table_path: Path,
+    verify_equivalence: bool = False,
+    verification_providers: list[str] | None = None,
+    verification_seed: int = 0,
+    verification_atol: float = 1e-2,
+    verification_rtol: float = 1e-2,
 ) -> dict[str, Any]:
     try:
         import onnx
@@ -497,6 +956,8 @@ def rewrite_model(
     _externalize_prompt_embedding(input_path, graph, prompt_embedding_table_path, onnx, changes)
     evaluator = ConstantEvaluator(input_path, graph, onnx)
     counts = {
+        "fixed_vision_batch_io": _rewrite_fixed_vision_batch_io(graph, evaluator, onnx, changes),
+        "rank6_patchify": _rewrite_patchify_rank6(graph, evaluator, onnx, changes),
         "einsum": _rewrite_unary_einsum(graph, onnx, changes),
         "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
@@ -509,7 +970,23 @@ def rewrite_model(
     onnx.checker.check_model(str(output_path))
 
     compatibility = inspect_model(output_path, DEFAULT_TARGET_OPS, max_rank=4)
+    verification = (
+        _verify_rewrite_equivalence(
+            input_path,
+            output_path,
+            prompt_embedding_table_path,
+            domain_id=domain_id,
+            providers=verification_providers,
+            seed=verification_seed,
+            atol=verification_atol,
+            rtol=verification_rtol,
+        )
+        if verify_equivalence
+        else {"enabled": False}
+    )
     remaining = compatibility["summary"]["target_node_count"]
+    remaining_high_rank_nodes = compatibility["summary"]["high_rank_node_count"]
+    remaining_high_rank_graph_io = compatibility["summary"]["high_rank_graph_io_count"]
     report = {
         "input_path": str(input_path.resolve()),
         "output_path": str(output_path.resolve()),
@@ -517,8 +994,11 @@ def rewrite_model(
         "domain_id": domain_id,
         "counts": counts,
         "remaining_target_nodes": remaining,
+        "remaining_high_rank_nodes": remaining_high_rank_nodes,
+        "remaining_high_rank_graph_io": remaining_high_rank_graph_io,
         "changes": changes,
         "compatibility_summary": compatibility["summary"],
+        "verification": verification,
         "equivalence": {
             "exact_rewrites": (
                 "Einsum, ConstantOfShape, constant/scalar Gather, and validated ScatterElements patterns."
@@ -541,6 +1021,17 @@ def main() -> None:
     parser.add_argument("--domain-id", type=int, default=8, help="Fixed action domain; DROID is 8.")
     parser.add_argument("--prompt-embedding-table-path", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=None)
+    parser.add_argument("--verify-equivalence", action="store_true")
+    parser.add_argument(
+        "--verification-provider",
+        action="append",
+        dest="verification_providers",
+        default=None,
+        help="ONNX Runtime provider in priority order; repeat for fallbacks.",
+    )
+    parser.add_argument("--verification-seed", type=int, default=0)
+    parser.add_argument("--verification-atol", type=float, default=1e-2)
+    parser.add_argument("--verification-rtol", type=float, default=1e-2)
     args = parser.parse_args()
 
     if not args.input_path.is_file():
@@ -556,6 +1047,11 @@ def main() -> None:
         args.output_path,
         domain_id=args.domain_id,
         prompt_embedding_table_path=prompt_embedding_table_path,
+        verify_equivalence=args.verify_equivalence,
+        verification_providers=args.verification_providers,
+        verification_seed=args.verification_seed,
+        verification_atol=args.verification_atol,
+        verification_rtol=args.verification_rtol,
     )
     report_path = args.report_path or args.output_path.with_suffix(args.output_path.suffix + ".rewrite.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -566,11 +1062,25 @@ def main() -> None:
     print(f"  action_domain_id is fixed to {args.domain_id}")
     print("  prompt_embeddings must come from the original prompt embedding table")
     print("  attention scores must be finite before causal masking")
-    if report["remaining_target_nodes"]:
+    if report["verification"]["enabled"]:
+        print("ONNX Runtime equivalence verification:")
+        for name, metrics in report["verification"]["outputs"].items():
+            print(
+                f"  {name}: allclose={metrics['allclose']} "
+                f"max_abs_error={metrics['max_abs_error']:.8g} "
+                f"mean_abs_error={metrics['mean_abs_error']:.8g}"
+            )
+    if (
+        report["remaining_target_nodes"]
+        or report["remaining_high_rank_nodes"]
+        or report["remaining_high_rank_graph_io"]
+    ):
         op_counts = report["compatibility_summary"]["op_counts"]
         remaining_counts = {op: op_counts.get(op, 0) for op in DEFAULT_TARGET_OPS}
         raise RuntimeError(
-            f"Rewritten model still has {report['remaining_target_nodes']} target nodes: {remaining_counts}. "
+            f"Rewritten model still has {report['remaining_target_nodes']} target nodes "
+            f"{remaining_counts}, {report['remaining_high_rank_nodes']} high-rank nodes, and "
+            f"{report['remaining_high_rank_graph_io']} high-rank graph I/O tensors. "
             f"See {report_path}."
         )
 
