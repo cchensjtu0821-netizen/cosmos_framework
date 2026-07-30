@@ -334,31 +334,54 @@ def _rewrite_scatter_elements(
     onnx: Any,
     changes: list[dict[str, Any]],
 ) -> int:
+    producers = _producer_map(graph)
     count = 0
     for node in list(graph.node):
         if node.op_type != "ScatterElements" or int(_attribute(node, "axis", onnx, 0)) != 0:
             continue
         indices = evaluator.evaluate(node.input[1])
-        if indices is None:
-            continue
         reduction = _attribute(node, "reduction", onnx, b"none")
         if isinstance(reduction, bytes):
             reduction = reduction.decode()
 
         compact: np.ndarray | None = None
-        if indices.ndim == 2 and np.all(indices == indices[:, :1]):
+        compact_name: str | None = None
+        rewrite = "ScatterElements(axis=0)->ScatterND"
+        if indices is not None and indices.ndim == 2 and np.all(indices == indices[:, :1]):
             compact = indices[:, :1]
-        elif indices.ndim >= 2 and np.all(indices == indices.reshape(-1)[0]):
+        elif indices is not None and indices.ndim >= 2 and np.all(indices == indices.reshape(-1)[0]):
             compact = np.asarray([[indices.reshape(-1)[0]]], dtype=indices.dtype)
-        if compact is None:
-            continue
 
-        compact_name = _add_initializer(
-            graph,
-            _unique_name(graph, f"{node.output[0]}_scatternd_indices"),
-            compact.astype(np.int64),
-            onnx,
-        )
+        if compact is not None:
+            compact_name = _add_initializer(
+                graph,
+                _unique_name(graph, f"{node.output[0]}_scatternd_indices"),
+                compact.astype(np.int64),
+                onnx,
+            )
+        else:
+            # torch.scatter_add(dim=0) exports a 1-D row index as
+            # Unsqueeze(index, 1) -> Expand([N, hidden]) -> ScatterElements.
+            # ScatterND accepts the compact [N, 1] index directly and applies
+            # each [hidden] update to the selected row, so dropping only the
+            # redundant Expand is exactly equivalent.
+            expand_node = producers.get(node.input[1])
+            if expand_node is None or expand_node.op_type != "Expand" or not expand_node.input:
+                continue
+            candidate_name = expand_node.input[0]
+            unsqueeze_node = producers.get(candidate_name)
+            if unsqueeze_node is None or unsqueeze_node.op_type != "Unsqueeze" or not unsqueeze_node.input:
+                continue
+            axes = (
+                evaluator.evaluate(unsqueeze_node.input[1])
+                if len(unsqueeze_node.input) > 1
+                else np.asarray(_attribute(unsqueeze_node, "axes", onnx, []), dtype=np.int64)
+            )
+            if axes is None or axes.size != 1 or int(axes.reshape(-1)[0]) not in (1, -1):
+                continue
+            compact_name = candidate_name
+            rewrite = "ScatterElements(axis=0, expanded row indices)->ScatterND"
+
         old_name = node.name
         node.op_type = "ScatterND"
         node.name = old_name.replace("scatter", "scatternd") if old_name else old_name
@@ -370,7 +393,7 @@ def _rewrite_scatter_elements(
             {
                 "kind": "exact",
                 "node": old_name,
-                "rewrite": "ScatterElements(axis=0)->ScatterND",
+                "rewrite": rewrite,
                 "reduction": reduction,
             }
         )
