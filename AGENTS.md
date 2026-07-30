@@ -112,3 +112,55 @@ When handing off a change, report:
 - exact server command to run;
 - expected audit result;
 - numerical equivalence checks still required.
+
+## Active ONNX Worklog — 2026-07-30
+
+The FP32 Edge Policy export and structural rewrites currently reach:
+
+- zero target-unsupported nodes when all rewrites are enabled;
+- zero tensors above rank 4, including graph I/O;
+- finite, exactly equal outputs when both causal `Where` rewriting and vision
+  rank lowering are disabled with `--keep-causal-where --keep-vision-ranks`.
+
+Two numerical-equivalence issues remain:
+
+1. **Causal mask rewrite**
+   - Original: `Where(mask, -Inf, attention_scores)`.
+   - Current attempted replacement: `Clip(attention_scores) + causal_bias`.
+   - With the replacement enabled, both rewritten outputs become entirely
+     non-finite while the reference outputs remain finite.
+   - Keeping the original 28 `Where` nodes removes the non-finite outputs.
+   - Do not treat `Clip + Add` as an accepted solution. A future replacement
+     must preserve overwrite semantics even when masked source values are NaN
+     or Inf; fixed unique-index `ScatterND` is the leading candidate.
+
+2. **Vision rank lowering**
+   - The rank-6 patchify/unpatchify and rank-5 I/O lowering passes structural
+     inspection but is not numerically equivalent.
+   - With causal `Where` retained but vision rank lowering enabled, observed
+     errors were approximately:
+     `vision_velocity max_abs_error=8.5640602`,
+     `action_velocity max_abs_error=0.082353115`.
+   - With `--keep-vision-ranks`, both outputs are finite and exactly equal:
+     `allclose=True`, `max_abs_error=0`.
+   - Recheck `SpaceToDepth`/`DepthToSpace` channel and patch-element ordering
+     against the original six-dimensional Reshape/Transpose layouts.
+
+This isolation run also left the `ScatterElements -> ScatterND` rewrite enabled
+and still produced exact outputs when the two problematic passes were disabled.
+That is evidence that ScatterElements rewriting is not responsible for the
+currently observed mismatch, though final full-model validation remains
+required after the two issues above are fixed.
+
+Useful diagnostic flags:
+
+```text
+--keep-causal-where
+--keep-vision-ranks
+--keep-scatter-elements
+```
+
+Diagnostic outputs are not deployment-compatible. A saved ONNX file is usable
+only after the command exits successfully with `finite=True`,
+`nonfinite=(0,0)`, `allclose=True`, zero unsupported target nodes, and zero
+high-rank nodes/I/O.
