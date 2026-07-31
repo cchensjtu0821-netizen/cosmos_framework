@@ -12,7 +12,7 @@ its serving forward path. It targets the exact patterns emitted by
 * supported axis-0 ScatterElements layouts -> ScatterND
 * fixed batch-1 vision I/O -> rank-4 vision I/O
 * fixed rank-6 vision patchify/unpatchify -> rank <= 4 space/depth layouts
-* causal Trilu + Where(mask, -inf, scores) -> ScatterND(scores, masked indices, -inf)
+* causal Trilu + Where(mask, -inf, scores) -> GatherND unmasked scores + ScatterND
 * prompt token embedding Gather -> a ``prompt_embeddings`` graph input
 * fixed DROID action domain -> constant domain ID 8
 
@@ -762,37 +762,44 @@ def _rewrite_causal_where_safe(
             broadcast_mask = np.broadcast_to(condition.astype(bool), scores_shape)
         except ValueError:
             continue
-        masked_indices = np.argwhere(broadcast_mask).astype(np.int64)
-        if masked_indices.shape[0] != int(np.count_nonzero(broadcast_mask)):
+        unmasked_indices = np.argwhere(~broadcast_mask).astype(np.int64)
+        if unmasked_indices.shape[0] != int(np.count_nonzero(~broadcast_mask)):
             continue
-        masked_updates = np.full((masked_indices.shape[0],), fill, dtype=score_dtype)
-        indices_name = _add_initializer(
+        fill_base = np.full(scores_shape, fill, dtype=score_dtype)
+        base_name = _add_initializer(
             graph,
-            _unique_name(graph, f"{node.output[0]}_masked_indices"),
-            masked_indices,
+            _unique_name(graph, f"{node.output[0]}_causal_fill"),
+            fill_base,
             onnx,
         )
-        updates_name = _add_initializer(
+        indices_name = _add_initializer(
             graph,
-            _unique_name(graph, f"{node.output[0]}_masked_updates"),
-            masked_updates,
+            _unique_name(graph, f"{node.output[0]}_unmasked_indices"),
+            unmasked_indices,
             onnx,
         )
         old_name = node.name
+        safe_updates = _unique_name(graph, f"{node.output[0]}_unmasked_scores")
+        gather_node = onnx.helper.make_node(
+            "GatherND",
+            [scores_name, indices_name],
+            [safe_updates],
+            name=old_name.replace("masked_fill", "causal_gather") if old_name else old_name,
+        )
         scatter_node = onnx.helper.make_node(
             "ScatterND",
-            [scores_name, indices_name, updates_name],
+            [base_name, indices_name, safe_updates],
             [node.output[0]],
             name=old_name.replace("masked_fill", "causal_scatter") if old_name else old_name,
         )
-        _replace_node(graph, [node], [scatter_node])
+        _replace_node(graph, [node], [gather_node, scatter_node])
         changes.append(
             {
                 "kind": "exact_for_fixed_configuration",
                 "node": old_name,
-                "rewrite": "Trilu+Where->ScatterND masked overwrite",
+                "rewrite": "Trilu+Where->GatherND unmasked scores+ScatterND into -Inf base",
                 "scores_shape": list(scores_shape),
-                "masked_update_count": int(masked_indices.shape[0]),
+                "preserved_update_count": int(unmasked_indices.shape[0]),
             }
         )
         count += 1
@@ -1201,7 +1208,9 @@ def rewrite_model(
             "interface_requirement": (
                 "prompt_embeddings must equal the original embedding table lookup for prompt_token_ids."
             ),
-            "causal_mask": "ScatterND overwrites every fixed causal-mask position with -Inf.",
+            "causal_mask": (
+                "GatherND reads only unmasked scores, then ScatterND writes them into a clean -Inf base."
+            ),
             "numerical_validation": "Not performed by this structural rewrite; compare outputs on deployment inputs.",
         },
     }
@@ -1279,7 +1288,7 @@ def main() -> None:
     print("Equivalence conditions:")
     print(f"  action_domain_id is fixed to {args.domain_id}")
     print("  prompt_embeddings must come from the original prompt embedding table")
-    print("  causal masking uses exact fixed-index ScatterND overwrite semantics")
+    print("  causal masking gathers only unmasked scores into a clean -Inf base")
     if report["verification"]["enabled"]:
         print("ONNX Runtime equivalence verification:")
         for name, metrics in report["verification"]["outputs"].items():
