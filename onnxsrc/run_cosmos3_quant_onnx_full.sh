@@ -12,6 +12,7 @@ COSMOS3_DOPT_SIM_PATH="${COSMOS3_DOPT_SIM_PATH:-/srv/data2/c00932551/Nvidia_mode
 COSMOS3_LAYOUT_MANIFEST="${COSMOS3_LAYOUT_MANIFEST:-/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/edge_policy.fp32.onnx.json}"
 COSMOS3_CONDITION_VISION_FRAMES="${COSMOS3_CONDITION_VISION_FRAMES:-0}"
 COSMOS3_CONDITION_ACTION_FRAMES="${COSMOS3_CONDITION_ACTION_FRAMES:-0}"
+COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-1}"  # 1: embedding sidecar；0: 写入主量化文件
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-0}"  # 1: 删除并重建本次输出目录；0: 保留
 
 if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
@@ -90,6 +91,7 @@ echo "========== Step 1: generate DOPT config =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/cosmos3_quantize.py" \
     --stage gen-config \
     --quant-output-dir "${COSMOS3_QUANT_OUTPUT_DIR}" \
+    --embedding-separate "${COSMOS3_EMBEDDING_SEPARATE}" \
     "${COMMON_ARGS[@]}"
 
 echo "========== Step 2: select INT8 dyn_s8 Linear layers =========="
@@ -102,6 +104,7 @@ echo "========== Step 3: calibrate and generate quant files =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/cosmos3_quantize.py" \
     --stage quant \
     --quant-output-dir "${COSMOS3_QUANT_OUTPUT_DIR}" \
+    --embedding-separate "${COSMOS3_EMBEDDING_SEPARATE}" \
     "${COMMON_ARGS[@]}"
 
 echo "========== Step 4: export DOPT fake-quant ONNX =========="

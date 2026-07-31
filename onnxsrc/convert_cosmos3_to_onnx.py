@@ -45,19 +45,29 @@ def main() -> None:
     if not args.fakequant_weight.is_file():
         raise FileNotFoundError(f"Fake-quant state dict does not exist: {args.fakequant_weight}")
 
-    _generate_config, _generate_params, optimize_model, _set_calibrate, _set_quant = _import_dopt(
+    _generate_config, _generate_params, optimize_model, set_calibrate_state, set_quant_state = _import_dopt(
         args.dopt_sim_path
     )
     service, export_args, packed, inputs = _load_fixed_policy(args)
     quant_net = optimize_model(service.model.net.float().eval(), str(args.quant_config)).eval()
     state_dict = torch.load(args.fakequant_weight, map_location="cpu")
     incompatible = quant_net.load_state_dict(state_dict, strict=False)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
+    missing_model_keys = [
+        key for key in incompatible.missing_keys if ".quant_op." not in key
+    ]
+    if missing_model_keys or incompatible.unexpected_keys:
         raise RuntimeError(
-            "Fake-quant state dict does not exactly match the reconstructed DOPT graph: "
-            f"missing={incompatible.missing_keys[:20]}, "
+            "Fake-quant state dict does not match the reconstructed model weights: "
+            f"missing_model_keys={missing_model_keys[:20]}, "
             f"unexpected={incompatible.unexpected_keys[:20]}"
         )
+    if incompatible.missing_keys:
+        print(
+            "DOPT quantizer state is absent from the fake-quant checkpoint and will "
+            f"be reconstructed from the quant config and model weights: {len(incompatible.missing_keys)} key(s)"
+        )
+    set_quant_state(quant_net, weight_state=True, input_state=True)
+    set_calibrate_state(quant_net, False)
     quant_net = quant_net.to(device=torch.device("cuda"), dtype=torch.float32).eval()
     _install_onnx_attention(quant_net)
     wrapper = PolicyDenoiserOnnxWrapper(quant_net, packed).float().eval()

@@ -180,6 +180,7 @@ def main() -> None:
     parser.add_argument("--layout-manifest", type=Path, required=True)
     parser.add_argument("--condition-vision-frames", default="0")
     parser.add_argument("--condition-action-frames", default="0")
+    parser.add_argument("--embedding-separate", type=int, choices=(0, 1), default=1)
     parser.add_argument("--prompt", default="Pick up the object and place it in the target location.")
     parser.add_argument("--image-height", type=int, default=540)
     parser.add_argument("--image-width", type=int, default=640)
@@ -226,7 +227,7 @@ def main() -> None:
         quant_net,
         str(args.quant_output_dir),
         quant_param_2=False,
-        embedding_separate=True,
+        embedding_separate=bool(args.embedding_separate),
     )
     print(f"Saved fake-quant state dict: {args.fakequant_weight}")
     print(f"Generated quant params with base path: {args.quant_output_dir}")

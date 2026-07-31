@@ -50,3 +50,9 @@ Use repeatable `--exclude-regex` arguments for backend-sensitive Linear
 modules. The generated JSON report records every selected and excluded layer.
 Start without exclusions, then exclude only layers demonstrated unsupported or
 numerically sensitive by server validation.
+
+`COSMOS3_EMBEDDING_SEPARATE=1` asks DOPT to emit embedding weights and
+dequantization scales as sidecar files. These include the language-model token
+embedding and the action-to/from-LLM projection adapters; they are still inside
+the VFM denoiser boundary. Set the switch to `0` only when the target DOPT
+deployment accepts embeddings inside the main quant-parameter file.
