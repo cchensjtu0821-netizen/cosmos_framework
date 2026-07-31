@@ -176,7 +176,7 @@ python -m cosmos_framework.scripts.rewrite_action_policy_onnx \
 - 将 `ConstantOfShape` 改为标量 initializer + `Expand`；
 - 折叠常量 `Gather`，将常量标量 `Gather` 改为 `Slice + Squeeze`；
 - 将可证明为 axis-0 固定索引布局的 `ScatterElements` 改为 `ScatterND`；
-- 将 causal `Trilu + Where` 改为固定 causal bias + `Add`；
+- 将 causal `Trilu + Where` 改为固定唯一索引的 `ScatterND` 覆盖；
 - 将 `action_domain_id` 固定为 DROID domain ID 8；
 - 将 `prompt_token_ids` 输入替换为 `prompt_embeddings`，并导出原始
   embedding 表 `.npy` sidecar。
@@ -192,7 +192,8 @@ python -m cosmos_framework.scripts.rewrite_action_policy_onnx \
 - domain 改写只对固定 `droid_lerobot`（ID 8）部署等价；
 - 宿主端必须使用导出的 embedding 表，根据 token ID 生成
   `[108, 2048]` 的 `prompt_embeddings`；
-- additive causal bias 要求 mask 前 attention score 为有限值。
+- causal `ScatterND` 直接将 mask 位置覆盖为 `-Inf`，即使被覆盖的
+  attention score 是 `NaN/Inf`，也保持原始 `Where` 的覆盖语义。
 
 ## 当前状态和首次验证清单
 

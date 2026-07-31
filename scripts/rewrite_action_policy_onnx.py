@@ -12,13 +12,13 @@ its serving forward path. It targets the exact patterns emitted by
 * supported axis-0 ScatterElements layouts -> ScatterND
 * fixed batch-1 vision I/O -> rank-4 vision I/O
 * fixed rank-6 vision patchify/unpatchify -> rank <= 4 space/depth layouts
-* causal Trilu + Where(mask, -inf, scores) -> Add(scores, causal_bias)
+* causal Trilu + Where(mask, -inf, scores) -> ScatterND(scores, masked indices, -inf)
 * prompt token embedding Gather -> a ``prompt_embeddings`` graph input
 * fixed DROID action domain -> constant domain ID 8
 
-The causal-mask rewrite is equivalent for finite attention scores. The prompt
-rewrite is interface-equivalent when the host supplies embeddings produced by
-the exported model's original embedding table.
+The causal-mask rewrite preserves overwrite semantics even when masked scores
+are non-finite. The prompt rewrite is interface-equivalent when the host
+supplies embeddings produced by the exported model's original embedding table.
 """
 
 from __future__ import annotations
@@ -40,6 +40,28 @@ def _initializer_map(graph: Any) -> dict[str, Any]:
 
 def _producer_map(graph: Any) -> dict[str, Any]:
     return {output: node for node in graph.node for output in node.output if output}
+
+
+def _static_tensor_shape(graph: Any, name: str) -> tuple[int, ...] | None:
+    """Return a fully static tensor shape recorded in the ONNX graph."""
+    initializer = _initializer_map(graph).get(name)
+    if initializer is not None:
+        return tuple(int(value) for value in initializer.dims)
+
+    value = next(
+        (
+            candidate
+            for candidate in [*graph.input, *graph.output, *graph.value_info]
+            if candidate.name == name
+        ),
+        None,
+    )
+    if value is None or not value.type.HasField("tensor_type"):
+        return None
+    dims = value.type.tensor_type.shape.dim
+    if any(not dim.HasField("dim_value") for dim in dims):
+        return None
+    return tuple(int(dim.dim_value) for dim in dims)
 
 
 def _attribute(node: Any, name: str, onnx: Any, default: Any = None) -> Any:
@@ -712,7 +734,7 @@ def _rewrite_causal_where_safe(
     onnx: Any,
     changes: list[dict[str, Any]],
 ) -> int:
-    """Wrapper retaining score input while replacing Where nodes."""
+    """Replace a fixed causal Where with exact ScatterND overwrite semantics."""
     count = 0
     producers = _producer_map(graph)
     for node in list(graph.node):
@@ -729,44 +751,48 @@ def _rewrite_causal_where_safe(
         if not np.isneginf(fill):
             continue
         scores_name = node.input[2]
-        bias = np.where(condition.astype(bool), fill, np.asarray(0, dtype=fill_value.dtype))
-        bias_name = _add_initializer(graph, _unique_name(graph, f"{node.output[0]}_causal_bias"), bias, onnx)
         score_dtype = np.dtype(fill_value.dtype)
         if not np.issubdtype(score_dtype, np.floating):
             continue
-        limits = np.finfo(score_dtype)
-        clip_min = _add_initializer(
+
+        scores_shape = _static_tensor_shape(graph, scores_name)
+        if scores_shape is None:
+            continue
+        try:
+            broadcast_mask = np.broadcast_to(condition.astype(bool), scores_shape)
+        except ValueError:
+            continue
+        masked_indices = np.argwhere(broadcast_mask).astype(np.int64)
+        if masked_indices.shape[0] != int(np.count_nonzero(broadcast_mask)):
+            continue
+        masked_updates = np.full((masked_indices.shape[0],), fill, dtype=score_dtype)
+        indices_name = _add_initializer(
             graph,
-            _unique_name(graph, f"{node.output[0]}_finite_min"),
-            np.asarray(limits.min, dtype=score_dtype),
+            _unique_name(graph, f"{node.output[0]}_masked_indices"),
+            masked_indices,
             onnx,
         )
-        clip_max = _add_initializer(
+        updates_name = _add_initializer(
             graph,
-            _unique_name(graph, f"{node.output[0]}_finite_max"),
-            np.asarray(limits.max, dtype=score_dtype),
+            _unique_name(graph, f"{node.output[0]}_masked_updates"),
+            masked_updates,
             onnx,
         )
-        clipped_scores = _unique_name(graph, f"{node.output[0]}_finite_scores")
         old_name = node.name
-        clip_node = onnx.helper.make_node(
-            "Clip",
-            [scores_name, clip_min, clip_max],
-            [clipped_scores],
-            name=f"{old_name}_clip_finite_scores",
+        scatter_node = onnx.helper.make_node(
+            "ScatterND",
+            [scores_name, indices_name, updates_name],
+            [node.output[0]],
+            name=old_name.replace("masked_fill", "causal_scatter") if old_name else old_name,
         )
-        insert_at = list(graph.node).index(node)
-        graph.node.insert(insert_at, clip_node)
-        node.op_type = "Add"
-        node.name = old_name.replace("masked_fill", "causal_add") if old_name else old_name
-        del node.input[:]
-        node.input.extend([clipped_scores, bias_name])
+        _replace_node(graph, [node], [scatter_node])
         changes.append(
             {
-                "kind": "finite_input_equivalent",
+                "kind": "exact_for_fixed_configuration",
                 "node": old_name,
-                "rewrite": "Trilu+Where->Clip(finite scores)+Add(causal_bias)",
-                "requirement": "Attention scores must be finite before masking.",
+                "rewrite": "Trilu+Where->ScatterND masked overwrite",
+                "scores_shape": list(scores_shape),
+                "masked_update_count": int(masked_indices.shape[0]),
             }
         )
         count += 1
@@ -1175,7 +1201,7 @@ def rewrite_model(
             "interface_requirement": (
                 "prompt_embeddings must equal the original embedding table lookup for prompt_token_ids."
             ),
-            "finite_input_requirement": "Attention scores must be finite before additive causal masking.",
+            "causal_mask": "ScatterND overwrites every fixed causal-mask position with -Inf.",
             "numerical_validation": "Not performed by this structural rewrite; compare outputs on deployment inputs.",
         },
     }
@@ -1253,7 +1279,7 @@ def main() -> None:
     print("Equivalence conditions:")
     print(f"  action_domain_id is fixed to {args.domain_id}")
     print("  prompt_embeddings must come from the original prompt embedding table")
-    print("  attention scores must be finite before causal masking")
+    print("  causal masking uses exact fixed-index ScatterND overwrite semantics")
     if report["verification"]["enabled"]:
         print("ONNX Runtime equivalence verification:")
         for name, metrics in report["verification"]["outputs"].items():
