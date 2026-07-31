@@ -12,10 +12,10 @@ COSMOS3_DOPT_SIM_PATH="${COSMOS3_DOPT_SIM_PATH:-/srv/data2/c00932551/Nvidia_mode
 COSMOS3_LAYOUT_MANIFEST="${COSMOS3_LAYOUT_MANIFEST:-/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/edge_policy.fp32.onnx.json}"
 COSMOS3_CONDITION_VISION_FRAMES="${COSMOS3_CONDITION_VISION_FRAMES:-0}"
 COSMOS3_CONDITION_ACTION_FRAMES="${COSMOS3_CONDITION_ACTION_FRAMES:-0}"
-COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-1}"  # 1: embedding sidecar；0: 写入主量化文件
+COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-0}"  # 默认只生成主量化文件
 COSMOS3_ONNX_EXPORTER="${COSMOS3_ONNX_EXPORTER:-legacy}"  # DOPT tensor 控制流需要 legacy tracer
 COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个 .onnx.data
-COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-0}"  # 1: 删除并重建本次输出目录；0: 保留
+COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
 
 if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
     echo "Cosmos3 repository directory not found: ${COSMOS3_REPO_DIR}" >&2
@@ -65,6 +65,8 @@ COSMOS3_QUANT_PARAMS_FILE="${COSMOS3_QUANT_PARAMS_FILE:-${COSMOS3_QUANT_OUTPUT_D
 COSMOS3_ONNX_RAW="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.onnx"
 COSMOS3_ONNX_COMPATIBLE="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.onnx"
 COSMOS3_ONNX_FINAL="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.named.onnx"
+COSMOS3_REWRITE_REPORT="${COSMOS3_ONNX_COMPATIBLE}.rewrite.json"
+COSMOS3_PROMPT_EMBEDDING="${COSMOS3_ONNX_COMPATIBLE}.prompt_embedding.npy"
 COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
 COSMOS3_MATCH_REPORT="${COSMOS3_QUANT_ROOT}/quant_onnx_name_match.json"
 COSMOS3_AUDIT_REPORT="${COSMOS3_QUANT_ROOT}/onnx_audit.json"
@@ -117,12 +119,21 @@ python3 "${COSMOS3_ONNX_SRC_DIR}/convert_cosmos3_to_onnx.py" \
     "${COMMON_ARGS[@]}"
 
 echo "========== Step 5: apply Cosmos3 Policy compatibility rewrites =========="
-python3 scripts/rewrite_action_policy_onnx.py \
+if ! python3 scripts/rewrite_action_policy_onnx.py \
     "${COSMOS3_ONNX_RAW}" \
     "${COSMOS3_ONNX_COMPATIBLE}" \
+    --prompt-embedding-table-path "${COSMOS3_PROMPT_EMBEDDING}" \
+    --report-path "${COSMOS3_REWRITE_REPORT}" \
     --verify-equivalence \
     --verification-provider CUDAExecutionProvider \
     --verification-provider CPUExecutionProvider
+then
+    rm -f -- \
+        "${COSMOS3_ONNX_COMPATIBLE}" \
+        "${COSMOS3_REWRITE_REPORT}" \
+        "${COSMOS3_PROMPT_EMBEDDING}"
+    exit 1
+fi
 
 echo "========== Step 6: normalize and deduplicate ONNX node names =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/finalize_onnx.py" \
@@ -146,10 +157,21 @@ python3 "${COSMOS3_ONNX_SRC_DIR}/audit_onnx.py" \
     --max-rank 4 \
     --report-path "${COSMOS3_AUDIT_REPORT}"
 
+echo "========== Step 9: remove reproducible intermediate files =========="
+rm -f -- \
+    "${COSMOS3_ONNX_RAW}" \
+    "${COSMOS3_ONNX_COMPATIBLE}" \
+    "${COSMOS3_QUANT_CONFIG}.backup" \
+    "${COSMOS3_QUANT_ROOT}/quant_info.txt" \
+    "${COSMOS3_REWRITE_REPORT}" \
+    "${COSMOS3_FINALIZE_REPORT}"
+
 echo "========== Done =========="
 echo "DOPT config: ${COSMOS3_QUANT_CONFIG}"
 echo "fake-quant weight: ${COSMOS3_FAKEQUANT_WEIGHT}"
 echo "quant params: ${COSMOS3_QUANT_PARAMS_FILE}"
 echo "final ONNX: ${COSMOS3_ONNX_FINAL}"
+echo "ONNX external data: ${COSMOS3_ONNX_RAW}.data"
+echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
 echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"

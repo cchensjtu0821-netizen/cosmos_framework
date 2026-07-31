@@ -32,7 +32,11 @@ from typing import Any
 
 import numpy as np
 
-from cosmos_framework.scripts.inspect_action_policy_onnx import DEFAULT_TARGET_OPS, inspect_model
+from cosmos_framework.scripts.inspect_action_policy_onnx import (
+    DEFAULT_TARGET_OPS,
+    _value_info_shape,
+    inspect_model,
+)
 
 
 def _initializer_map(graph: Any) -> dict[str, Any]:
@@ -231,14 +235,31 @@ def _externalize_prompt_embedding(
             embedding_initializer,
             base_dir=str(model_path.parent),
         )
-        table_path.parent.mkdir(parents=True, exist_ok=True)
-        with table_path.open("wb") as table_file:
-            np.save(table_file, embedding_table, allow_pickle=False)
 
         output_name = node.output[0]
         output_info = next((value for value in graph.value_info if value.name == output_name), None)
         if output_info is None:
-            raise RuntimeError(f"Missing value_info for prompt embedding output {output_name!r}")
+            prompt_input = next(
+                (value for value in graph.input if value.name == "prompt_token_ids"),
+                None,
+            )
+            if prompt_input is None:
+                raise RuntimeError("Missing graph input 'prompt_token_ids'")
+            prompt_shape = _value_info_shape(prompt_input)
+            embedding_shape = tuple(int(dimension) for dimension in embedding_initializer.dims)
+            if prompt_shape is None or len(embedding_shape) < 2:
+                raise RuntimeError(
+                    f"Cannot infer prompt embedding output metadata: "
+                    f"prompt_shape={prompt_shape}, embedding_shape={embedding_shape}"
+                )
+            output_info = onnx.helper.make_tensor_value_info(
+                output_name,
+                embedding_initializer.data_type,
+                [*prompt_shape, *embedding_shape[1:]],
+            )
+        table_path.parent.mkdir(parents=True, exist_ok=True)
+        with table_path.open("wb") as table_file:
+            np.save(table_file, embedding_table, allow_pickle=False)
         prompt_embeddings = "prompt_embeddings"
         new_input = copy.deepcopy(output_info)
         new_input.name = prompt_embeddings

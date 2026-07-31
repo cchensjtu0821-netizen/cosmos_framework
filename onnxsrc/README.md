@@ -65,5 +65,11 @@ numerically sensitive by server validation.
 `COSMOS3_EMBEDDING_SEPARATE=1` asks DOPT to emit embedding weights and
 dequantization scales as sidecar files. These include the language-model token
 embedding and the action-to/from-LLM projection adapters; they are still inside
-the VFM denoiser boundary. Set the switch to `0` only when the target DOPT
-deployment accepts embeddings inside the main quant-parameter file.
+the VFM denoiser boundary. The workflow defaults to `0`, producing only the
+main quant-parameter file. Enable separation only when required by the target
+DOPT deployment.
+
+The compatibility rewrite emits one prompt embedding table even when DOPT
+embedding separation is disabled. This table is a required deployment input:
+the restricted graph replaces the unsupported token-embedding `Gather` with a
+`prompt_embeddings` graph input, so the host must perform that lookup.
