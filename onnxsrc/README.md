@@ -21,7 +21,10 @@ sampler, CFG loop, or action postprocessing.
    control flow. Export-time constant folding is disabled because the legacy
    folder can mix generated CPU constants with CUDA DOPT tensors. A pre-export
    audit rejects parameters, buffers, unregistered tensor attributes, or
-   inputs found on the wrong device.
+   inputs found on the wrong device. The resulting fake-quant ONNX keeps the
+   original export's FP32 floating boundary and fails if any FP16/BF16
+   initializer remains; INT8 deployment parameters stay in the DOPT quant
+   files rather than changing ONNX graph I/O to INT8.
 5. The existing Policy compatibility rewrite removes target-unsupported
    operators and lowers vision ranks.
 6. `finalize_onnx.py` assigns every node a unique non-empty name.

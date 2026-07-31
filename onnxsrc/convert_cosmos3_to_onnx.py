@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -14,6 +15,7 @@ from cosmos_framework.scripts.export_action_policy_onnx import (
     PolicyDenoiserOnnxWrapper,
     _install_onnx_attention,
     _shape_manifest,
+    _verify_float32_onnx,
 )
 
 
@@ -54,6 +56,34 @@ def _audit_export_tensor_devices(
         f"Export device audit passed: parameters, buffers, tensor attributes, "
         f"and {len(inputs)} inputs are on {expected_device}"
     )
+
+
+def _verify_fp32_graph_io(model_path: Path, onnx: Any) -> dict[str, int]:
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    floating_types = {
+        onnx.TensorProto.FLOAT16,
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.DOUBLE,
+        onnx.TensorProto.BFLOAT16,
+    }
+    counts = {"float32": 0, "non_float": 0}
+    offenders: list[str] = []
+    for value in [*model.graph.input, *model.graph.output]:
+        element_type = value.type.tensor_type.elem_type
+        if element_type == onnx.TensorProto.FLOAT:
+            counts["float32"] += 1
+        elif element_type in floating_types:
+            offenders.append(
+                f"{value.name}:{onnx.TensorProto.DataType.Name(element_type)}"
+            )
+        else:
+            counts["non_float"] += 1
+    if offenders:
+        raise RuntimeError(
+            "Fake-quant ONNX floating graph I/O must be FP32, found "
+            + ", ".join(offenders)
+        )
+    return counts
 
 
 def main() -> None:
@@ -149,6 +179,13 @@ def main() -> None:
     import onnx
 
     onnx.checker.check_model(str(args.output))
+    forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
+    graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
+    print(
+        "Verified FP32 fake-quant ONNX initializers: "
+        f"forbidden dtype counts={forbidden_float_initializer_counts}"
+    )
+    print(f"Verified fake-quant ONNX graph I/O dtypes: {graph_io_dtype_counts}")
     manifest = {
         "scope": "DOPT fake-quant fixed-layout Cosmos3 Policy MoT denoiser",
         "checkpoint_path": args.checkpoint_path,
@@ -158,6 +195,8 @@ def main() -> None:
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": args.exporter,
+        "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
+        "graph_io_dtype_counts": graph_io_dtype_counts,
     }
     manifest_path = args.output.with_suffix(args.output.suffix + ".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
