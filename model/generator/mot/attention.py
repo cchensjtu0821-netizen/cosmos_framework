@@ -186,8 +186,20 @@ def _onnx_dense_attention(
         if num_query_heads % num_kv_heads != 0:
             raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads})")
         repeats = num_query_heads // num_kv_heads
-        key = key.repeat_interleave(repeats, dim=1)
-        value = value.repeat_interleave(repeats, dim=1)
+        # Avoid repeat_interleave: the legacy ONNX tracer implements it with
+        # an index tensor on CPU, which fails while tracing CUDA Q/K/V. This
+        # view/expand/reshape sequence preserves repeat-interleave head order:
+        # [h0, h1] with repeats=2 -> [h0, h0, h1, h1].
+        key = (
+            key.unsqueeze(2)
+            .expand(key.shape[0], num_kv_heads, repeats, key.shape[2])
+            .reshape(key.shape[0], num_query_heads, key.shape[2])
+        )
+        value = (
+            value.unsqueeze(2)
+            .expand(value.shape[0], num_kv_heads, repeats, value.shape[2])
+            .reshape(value.shape[0], num_query_heads, value.shape[2])
+        )
 
     query = query.transpose(0, 1)  # [H,Nq,D]
     key = key.transpose(0, 1)  # [H,Nkv,D]
