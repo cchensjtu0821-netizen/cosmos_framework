@@ -59,27 +59,6 @@ def _audit_export_tensor_devices(
     )
 
 
-def _freeze_dopt_scalar_controls(model: torch.nn.Module) -> list[str]:
-    """Freeze only DOPT's tensor-valued ``bit`` branch control.
-
-    Other scalar-looking buffers are intentionally left as tensors: DOPT's
-    eager forward calls tensor methods on values such as ``unsigned_quant``.
-    """
-    control_names = {"bit"}
-    frozen: list[str] = []
-    for module_name, module in model.named_modules():
-        for name in control_names & module._buffers.keys():
-            value = module._buffers[name]
-            if not isinstance(value, torch.Tensor) or value.numel() != 1:
-                continue
-            scalar = value.detach().cpu().item()
-            del module._buffers[name]
-            setattr(module, name, scalar)
-            frozen.append(f"{module_name}.{name}" if module_name else name)
-    print(f"Frozen DOPT scalar control buffers for torch.export: {len(frozen)}")
-    return frozen
-
-
 def _verify_fp32_graph_io(model_path: Path, onnx: Any) -> dict[str, int]:
     model = onnx.load_model(str(model_path), load_external_data=False)
     floating_types = {
@@ -176,13 +155,7 @@ def main() -> None:
     parser.add_argument("--conditioning-fps", type=float, default=5.0)
     parser.add_argument("--resolution", default="480")
     parser.add_argument("--domain-name", default="droid_lerobot")
-    parser.add_argument("--opset-version", type=int, default=18)
-    parser.add_argument(
-        "--exporter",
-        choices=("legacy", "dynamo"),
-        default="dynamo",
-        help="Use the same dynamo exporter contract as the validated Policy rewrite.",
-    )
+    parser.add_argument("--opset-version", type=int, default=17)
     parser.add_argument(
         "--external-data-mode",
         choices=("single", "sharded"),
@@ -222,7 +195,6 @@ def main() -> None:
     set_quant_state(quant_net, weight_state=True, input_state=True)
     set_calibrate_state(quant_net, False)
     quant_net = quant_net.to(device=torch.device("cuda"), dtype=torch.float32).eval()
-    frozen_dopt_controls = _freeze_dopt_scalar_controls(quant_net)
     _install_onnx_attention(quant_net)
     wrapper = PolicyDenoiserOnnxWrapper(quant_net, packed).float().eval()
     float_inputs = tuple(value.float() if value.is_floating_point() else value for value in inputs)
@@ -237,22 +209,23 @@ def main() -> None:
     )
     output_names = ("vision_velocity", "action_velocity")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    use_dynamo = args.exporter == "dynamo"
-    print(f"Using ONNX exporter: {args.exporter}")
+    print("Using ONNX exporter: legacy (dynamo=False)")
 
-    with torch.inference_mode():
+    with torch.no_grad():
         reference_outputs = wrapper(*float_inputs)
         torch.onnx.export(
             wrapper,
             float_inputs,
             str(args.output),
+            export_params=True,
+            do_constant_folding=True,
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
-            dynamo=use_dynamo,
-            external_data=True,
-            do_constant_folding=False,
-            report=use_dynamo,
+            training=torch.onnx.TrainingMode.EVAL,
+            # Keep DA3's TorchScript/legacy tracing behavior across PyTorch
+            # versions whose default exporter may differ.
+            dynamo=False,
         )
 
     import onnx
@@ -276,8 +249,7 @@ def main() -> None:
         "inputs": _shape_manifest(input_names, float_inputs),
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
-        "onnx_exporter": args.exporter,
-        "frozen_dopt_scalar_controls": frozen_dopt_controls,
+        "onnx_exporter": "legacy",
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,

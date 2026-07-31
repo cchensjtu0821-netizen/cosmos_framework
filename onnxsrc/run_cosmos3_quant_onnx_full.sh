@@ -13,7 +13,6 @@ COSMOS3_LAYOUT_MANIFEST="${COSMOS3_LAYOUT_MANIFEST:-/srv/data2/c00932551/Nvidia_
 COSMOS3_CONDITION_VISION_FRAMES="${COSMOS3_CONDITION_VISION_FRAMES:-0}"
 COSMOS3_CONDITION_ACTION_FRAMES="${COSMOS3_CONDITION_ACTION_FRAMES:-0}"
 COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-0}"  # 默认只生成主量化文件
-COSMOS3_ONNX_EXPORTER="${COSMOS3_ONNX_EXPORTER:-dynamo}"  # 保持原 Policy rewrite 的图契约
 COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个 .onnx.data
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
 
@@ -114,7 +113,6 @@ python3 "${COSMOS3_ONNX_SRC_DIR}/cosmos3_quantize.py" \
 echo "========== Step 4: export DOPT fake-quant ONNX =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/convert_cosmos3_to_onnx.py" \
     --output "${COSMOS3_ONNX_RAW}" \
-    --exporter "${COSMOS3_ONNX_EXPORTER}" \
     --external-data-mode "${COSMOS3_EXTERNAL_DATA_MODE}" \
     "${COMMON_ARGS[@]}"
 
