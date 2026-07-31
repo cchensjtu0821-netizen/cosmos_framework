@@ -17,6 +17,45 @@ from cosmos_framework.scripts.export_action_policy_onnx import (
 )
 
 
+def _audit_export_tensor_devices(
+    model: torch.nn.Module,
+    inputs: tuple[torch.Tensor, ...],
+    expected_device: torch.device,
+) -> None:
+    offenders: list[str] = []
+    for name, parameter in model.named_parameters():
+        if parameter.device != expected_device:
+            offenders.append(f"parameter:{name}={parameter.device}")
+    for name, buffer in model.named_buffers():
+        if buffer.device != expected_device:
+            offenders.append(f"buffer:{name}={buffer.device}")
+    for module_name, module in model.named_modules():
+        parameter_names = set(module._parameters)
+        buffer_names = set(module._buffers)
+        for attribute_name, value in vars(module).items():
+            if (
+                isinstance(value, torch.Tensor)
+                and attribute_name not in parameter_names
+                and attribute_name not in buffer_names
+                and value.device != expected_device
+            ):
+                qualified_name = f"{module_name}.{attribute_name}" if module_name else attribute_name
+                offenders.append(f"tensor_attribute:{qualified_name}={value.device}")
+    for index, value in enumerate(inputs):
+        if value.device != expected_device:
+            offenders.append(f"input:{index}={value.device}")
+    if offenders:
+        preview = ", ".join(offenders[:50])
+        suffix = f" (+{len(offenders) - 50} more)" if len(offenders) > 50 else ""
+        raise RuntimeError(
+            f"ONNX export tensors must all be on {expected_device}; found {preview}{suffix}"
+        )
+    print(
+        f"Export device audit passed: parameters, buffers, tensor attributes, "
+        f"and {len(inputs)} inputs are on {expected_device}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", required=True)
@@ -78,6 +117,7 @@ def main() -> None:
     _install_onnx_attention(quant_net)
     wrapper = PolicyDenoiserOnnxWrapper(quant_net, packed).float().eval()
     float_inputs = tuple(value.float() if value.is_floating_point() else value for value in inputs)
+    _audit_export_tensor_devices(wrapper, float_inputs, torch.device("cuda", torch.cuda.current_device()))
     input_names = (
         "prompt_token_ids",
         "video_latent",
@@ -102,6 +142,7 @@ def main() -> None:
             opset_version=args.opset_version,
             dynamo=use_dynamo,
             external_data=True,
+            do_constant_folding=False,
             report=use_dynamo,
         )
 
