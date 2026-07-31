@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure Cosmos3 Linear layers for signed INT8 weight + dyn_s8 input."""
+"""Keep quantized Policy Linear layers and configure INT8 weight + dyn_s8 input."""
 
 from __future__ import annotations
 
@@ -9,6 +9,9 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any
+
+
+DEFAULT_EXCLUDE_REGEXES = [r"^language_model\.lm_head$"]
 
 
 def _matches_any(name: str, patterns: list[re.Pattern[str]]) -> bool:
@@ -34,10 +37,12 @@ def update_config(
     if not isinstance(strategies, dict):
         raise ValueError("DOPT config has no object-valued 'layer_strategy'")
 
-    exclusions = [re.compile(expression) for expression in exclude_regexes]
+    effective_exclude_regexes = [*DEFAULT_EXCLUDE_REGEXES, *exclude_regexes]
+    exclusions = [re.compile(expression) for expression in effective_exclude_regexes]
     selected: list[str] = []
     excluded: list[str] = []
     non_linear: list[str] = []
+    quantized_strategies: dict[str, dict[str, Any]] = {}
     quant_strategy: dict[str, Any] = {
         "weight": {
             "bit": 8,
@@ -55,10 +60,6 @@ def update_config(
         if not isinstance(layer_config, dict):
             continue
         layer_type = str(layer_config.get("type", ""))
-        layer_config["quant_strategy"] = "float"
-        for stale_key in ("weight", "input", "output"):
-            layer_config.pop(stale_key, None)
-
         if "torch.nn.modules.linear" not in layer_type:
             non_linear.append(layer_name)
             continue
@@ -66,17 +67,28 @@ def update_config(
             excluded.append(layer_name)
             continue
 
-        layer_config["weight"] = dict(quant_strategy["weight"])
-        layer_config["input"] = dict(quant_strategy["input"])
+        quantized_layer_config = dict(layer_config)
+        quantized_layer_config["quant_strategy"] = "float"
+        for stale_key in ("weight", "input", "output"):
+            quantized_layer_config.pop(stale_key, None)
+        quantized_layer_config["weight"] = dict(quant_strategy["weight"])
+        quantized_layer_config["input"] = dict(quant_strategy["input"])
+        quantized_strategies[layer_name] = quantized_layer_config
         selected.append(layer_name)
 
+    config["layer_strategy"] = quantized_strategies
     config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     report = {
         "config_path": str(config_path.resolve()),
         "backup_path": str(backup_path.resolve()),
-        "policy": "all torch.nn.Linear: signed INT8 per-channel weight + dyn_s8 input",
+        "policy": "reachable Policy torch.nn.Linear only: signed INT8 per-channel weight + dyn_s8 input",
         "bit": bit,
-        "exclude_regexes": exclude_regexes,
+        "default_exclude_regexes": DEFAULT_EXCLUDE_REGEXES,
+        "user_exclude_regexes": exclude_regexes,
+        "effective_exclude_regexes": effective_exclude_regexes,
+        "input_layer_count": len(strategies),
+        "output_layer_count": len(quantized_strategies),
+        "removed_layer_count": len(strategies) - len(quantized_strategies),
         "selected_linear_count": len(selected),
         "excluded_linear_count": len(excluded),
         "non_linear_count": len(non_linear),
@@ -87,6 +99,7 @@ def update_config(
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Selected Linear layers: {len(selected)}")
     print(f"Excluded Linear layers: {len(excluded)}")
+    print(f"Removed non-quantized layers: {len(strategies) - len(quantized_strategies)}")
     print(f"Updated config: {config_path}")
     print(f"Selection report: {report_path}")
 

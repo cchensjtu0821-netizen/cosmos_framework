@@ -10,7 +10,8 @@ sampler, CFG loop, or action postprocessing.
 
 1. `cosmos3_quantize.py --stage gen-config` creates the DOPT configuration.
 2. `modify_dopt_config.py` selects 8-bit weight + `dyn_s8` input quantization
-   for `torch.nn.Linear` layers. Non-Linear layers remain float.
+   for Policy `torch.nn.Linear` layers and removes non-quantized entries from
+   the deployment config.
 3. `cosmos3_quantize.py --stage quant` prepares the fixed Policy denoiser with
    synthetic tensors, saves the fake-quant state dict, and generates the
    encrypted quant file.
@@ -59,11 +60,12 @@ import it only after adding `COSMOS3_DOPT_SIM_PATH` to `sys.path`.
 ## Dynamic Linear policy
 
 The default modifier selects every config entry whose type contains
-`torch.nn.modules.linear`:
+`torch.nn.modules.linear`, except `language_model.lm_head`, which is not
+executed by the exported vision/action denoiser boundary:
 
 - weight: signed INT8, per-channel, `min_max`;
 - input: INT8 dynamic activation, `dyn_s8`;
-- all other layer types: float.
+- all non-quantized entries are omitted from the final DOPT config.
 
 Use repeatable `--exclude-regex` arguments for backend-sensitive Linear
 modules. The generated JSON report records every selected and excluded layer.
