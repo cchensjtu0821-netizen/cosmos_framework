@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a calibrated DOPT Cosmos3 Policy denoiser to fixed-layout FP32 ONNX."""
+"""Export a clean FP32 Cosmos3 Policy denoiser for separate DOPT parameters."""
 
 from __future__ import annotations
 
@@ -9,10 +9,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
-from cosmos_framework.onnxsrc.cosmos3_quantize import _import_dopt, _load_fixed_policy
+from cosmos_framework.onnxsrc.cosmos3_quantize import _load_fixed_policy
 from cosmos_framework.scripts.export_action_policy_onnx import (
     PolicyDenoiserOnnxWrapper,
     _install_onnx_attention,
@@ -180,75 +179,6 @@ def _simplify_onnx_in_place(model_path: Path, onnx: Any) -> None:
     print(f"Folded constants and simplified ONNX in place: {model_path}")
 
 
-def _promote_fp16_initializers_cast_only_to_fp32(model_path: Path, onnx: Any) -> list[str]:
-    """Promote shared FP16 constants whose consumers all cast them to FP32."""
-    model = onnx.load_model(str(model_path), load_external_data=True)
-    consumers: dict[str, list[Any]] = {}
-    for node in model.graph.node:
-        for input_name in node.input:
-            consumers.setdefault(input_name, []).append(node)
-
-    promoted: list[str] = []
-    for initializer in model.graph.initializer:
-        if initializer.data_type != onnx.TensorProto.FLOAT16:
-            continue
-        initializer_consumers = consumers.get(initializer.name, [])
-        if not initializer_consumers:
-            continue
-        if not all(
-            node.op_type == "Cast"
-            and any(
-                attribute.name == "to"
-                and attribute.i == onnx.TensorProto.FLOAT
-                for attribute in node.attribute
-            )
-            for node in initializer_consumers
-        ):
-            continue
-
-        values = onnx.numpy_helper.to_array(initializer).astype(np.float32)
-        replacement = onnx.numpy_helper.from_array(values, name=initializer.name)
-        initializer.CopyFrom(replacement)
-        promoted.append(initializer.name)
-
-    if not promoted:
-        return promoted
-
-    with tempfile.NamedTemporaryFile(
-        prefix=f".{model_path.name}.fp32-constants-",
-        suffix=model_path.suffix,
-        dir=model_path.parent,
-        delete=False,
-    ) as temporary_file:
-        temporary_model_path = Path(temporary_file.name)
-    temporary_model_path.unlink()
-    temporary_data_path = temporary_model_path.with_suffix(
-        temporary_model_path.suffix + ".data"
-    )
-    try:
-        onnx.save_model(
-            model,
-            str(temporary_model_path),
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=temporary_data_path.name,
-            size_threshold=1024 * 1024,
-            convert_attribute=True,
-        )
-        onnx.checker.check_model(str(temporary_model_path))
-        temporary_model_path.replace(model_path)
-        _consolidate_external_data(model_path, onnx)
-    finally:
-        temporary_model_path.unlink(missing_ok=True)
-        temporary_data_path.unlink(missing_ok=True)
-
-    print(
-        "Promoted FP16 constants consumed only by Cast(to=FLOAT): "
-        + ", ".join(promoted)
-    )
-    return promoted
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", required=True)
@@ -283,32 +213,29 @@ def main() -> None:
     if not args.fakequant_weight.is_file():
         raise FileNotFoundError(f"Fake-quant state dict does not exist: {args.fakequant_weight}")
 
-    _generate_config, _generate_params, optimize_model, set_calibrate_state, set_quant_state = _import_dopt(
-        args.dopt_sim_path
-    )
     service, export_args, packed, inputs = _load_fixed_policy(args)
-    quant_net = optimize_model(service.model.net.float().eval(), str(args.quant_config)).eval()
+    export_net = service.model.net.float().eval()
     state_dict = torch.load(args.fakequant_weight, map_location="cpu")
-    incompatible = quant_net.load_state_dict(state_dict, strict=False)
-    missing_model_keys = [
-        key for key in incompatible.missing_keys if ".quant_op." not in key
+    incompatible = export_net.load_state_dict(state_dict, strict=False)
+    unexpected_model_keys = [
+        key for key in incompatible.unexpected_keys if ".quant_op." not in key
     ]
-    if missing_model_keys or incompatible.unexpected_keys:
+    if incompatible.missing_keys or unexpected_model_keys:
         raise RuntimeError(
-            "Fake-quant state dict does not match the reconstructed model weights: "
-            f"missing_model_keys={missing_model_keys[:20]}, "
-            f"unexpected={incompatible.unexpected_keys[:20]}"
+            "Fake-quant checkpoint does not match the clean FP32 export model: "
+            f"missing={incompatible.missing_keys[:20]}, "
+            f"unexpected_model_keys={unexpected_model_keys[:20]}"
         )
-    if incompatible.missing_keys:
-        print(
-            "DOPT quantizer state is absent from the fake-quant checkpoint and will "
-            f"be reconstructed from the quant config and model weights: {len(incompatible.missing_keys)} key(s)"
-        )
-    set_quant_state(quant_net, weight_state=True, input_state=True)
-    set_calibrate_state(quant_net, False)
-    quant_net = quant_net.to(device=torch.device("cuda"), dtype=torch.float32).eval()
-    _install_onnx_attention(quant_net)
-    wrapper = PolicyDenoiserOnnxWrapper(quant_net, packed).float().eval()
+    ignored_quantizer_keys = [
+        key for key in incompatible.unexpected_keys if ".quant_op." in key
+    ]
+    print(
+        "Loaded matching FP32 weights from fake-quant checkpoint; ignored "
+        f"{len(ignored_quantizer_keys)} DOPT-only quantizer state key(s)"
+    )
+    export_net = export_net.to(device=torch.device("cuda"), dtype=torch.float32).eval()
+    _install_onnx_attention(export_net)
+    wrapper = PolicyDenoiserOnnxWrapper(export_net, packed).float().eval()
     float_inputs = tuple(value.float() if value.is_floating_point() else value for value in inputs)
     _audit_export_tensor_devices(wrapper, float_inputs, torch.device("cuda", torch.cuda.current_device()))
     input_names = (
@@ -330,12 +257,7 @@ def main() -> None:
             float_inputs,
             str(args.output),
             export_params=True,
-            # Cosmos3's traced graph contains CUDA tensors plus CPU shape/axis
-            # constants synthesized by the legacy exporter. Its JIT constant
-            # folding pass attempts to evaluate them together and fails with a
-            # mixed-device error. Keep folding disabled during export; later
-            # compatibility rewrites handle graph constants explicitly.
-            do_constant_folding=False,
+            do_constant_folding=True,
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
@@ -353,19 +275,16 @@ def main() -> None:
     _simplify_onnx_in_place(args.output, onnx)
     if args.external_data_mode == "single":
         external_data_path = args.output.with_suffix(args.output.suffix + ".data")
-    promoted_fp16_initializers = _promote_fp16_initializers_cast_only_to_fp32(
-        args.output, onnx
-    )
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
     print(
-        "Verified FP32 fake-quant ONNX initializers: "
+        "Verified clean FP32 ONNX initializers: "
         f"forbidden dtype counts={forbidden_float_initializer_counts}"
     )
-    print(f"Verified fake-quant ONNX graph I/O dtypes: {graph_io_dtype_counts}")
+    print(f"Verified clean ONNX graph I/O dtypes: {graph_io_dtype_counts}")
     manifest = {
-        "scope": "DOPT fake-quant fixed-layout Cosmos3 Policy MoT denoiser",
+        "scope": "clean FP32 fixed-layout Cosmos3 Policy MoT denoiser with separate DOPT parameters",
         "checkpoint_path": args.checkpoint_path,
         "dopt_config": str(args.quant_config.resolve()),
         "fakequant_weight": str(args.fakequant_weight.resolve()),
@@ -374,8 +293,7 @@ def main() -> None:
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": "legacy",
         "onnx_simplified": True,
-        "constant_folding": "onnxslim",
-        "promoted_fp16_cast_only_initializers": promoted_fp16_initializers,
+        "constant_folding": "pytorch_legacy_and_onnxslim",
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,

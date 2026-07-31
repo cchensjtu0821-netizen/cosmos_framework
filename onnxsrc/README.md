@@ -14,22 +14,19 @@ sampler, CFG loop, or action postprocessing.
 3. `cosmos3_quantize.py --stage quant` prepares the fixed Policy denoiser with
    synthetic tensors, saves the fake-quant state dict, and generates the
    encrypted quant file.
-4. `convert_cosmos3_to_onnx.py` reconstructs the same DOPT graph, loads the
-   fake-quant state dict, and exports ONNX using the DA3-style legacy tracer:
+4. `convert_cosmos3_to_onnx.py` builds the clean FP32 Policy graph, loads only
+   the matching model weights from the fake-quant state dict, ignores
+   DOPT-only `.quant_op.*` state, and exports ONNX using the DA3-style legacy tracer:
    `torch.no_grad()`, evaluation mode, and opset 17.
    `dynamo=False` is explicit so the behavior is stable across PyTorch
-   versions. DOPT configuration remains untouched and fake-quant arithmetic
-   is traced along the fixed example-input execution path. Export-time
-   constant folding is disabled because TorchScript synthesizes CPU
-   shape/axis constants alongside CUDA fake-quant tensors; folding that mixed
-   graph fails before ONNX serialization. Immediately after serialization,
-   `onnxslim` performs device-independent constant folding and graph
+   versions. No fake-quant arithmetic, Quant, or Dequant nodes are intentionally
+   included in the ONNX; deployment quantization remains in `quant_params_v2`
+   and is applied by the downstream ONNX-to-OM flow. PyTorch constant folding
+   is enabled, then `onnxslim` performs additional graph
    simplification, after which external tensors are repacked into one
-   `.onnx.data` file. If simplification leaves a shared FP16 constant whose
-   consumers are all `Cast(to=FLOAT)`, the constant is safely promoted to
-   FP32; any other FP16/BF16 initializer still fails validation.
+   `.onnx.data` file. Any FP16/BF16 initializer fails validation.
    A pre-export audit rejects parameters, buffers, unregistered tensor
-   attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
+   attributes, or inputs found on the wrong device. The resulting clean ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16
    initializer remains; INT8 deployment parameters stay in the DOPT quant
    files rather than changing ONNX graph I/O to INT8. Legacy export shards are
