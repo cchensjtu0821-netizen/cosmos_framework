@@ -315,7 +315,11 @@ def main() -> None:
             dummy_inputs,
             str(args.output),
             export_params=True,
-            do_constant_folding=True,
+            # The legacy JIT pass synthesizes CPU shape/axis constants while
+            # tracing this CUDA graph, then tries to execute mixed-device
+            # constant subgraphs. Serialize first and let onnxslim perform
+            # device-independent constant folding below.
+            do_constant_folding=False,
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
@@ -353,7 +357,7 @@ def main() -> None:
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": "legacy",
         "onnx_simplified": True,
-        "constant_folding": "pytorch_legacy_and_onnxslim",
+        "constant_folding": "onnxslim_after_legacy_export",
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,

@@ -21,10 +21,12 @@ sampler, CFG loop, or action postprocessing.
    `dynamo=False` is explicit so the behavior is stable across PyTorch
    versions. No fake-quant arithmetic, Quant, or Dequant nodes are intentionally
    included in the ONNX; deployment quantization remains in `quant_params_v2`
-   and is applied by the downstream ONNX-to-OM flow. PyTorch constant folding
-   is enabled, then `onnxslim` performs additional graph
-   simplification, after which external tensors are repacked into one
-   `.onnx.data` file. Any FP16/BF16 initializer fails validation.
+   and is applied by the downstream ONNX-to-OM flow. PyTorch legacy constant
+   folding is disabled because it mixes tracer-created CPU constants with the
+   CUDA graph; after serialization, `onnxslim` performs device-independent
+   constant folding and graph simplification. External tensors are then
+   repacked into one `.onnx.data` file. Any FP16/BF16 initializer fails
+   validation.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting clean ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16
