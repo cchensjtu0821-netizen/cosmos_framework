@@ -16,17 +16,14 @@ sampler, CFG loop, or action postprocessing.
    encrypted quant file.
 4. `convert_cosmos3_to_onnx.py` builds the clean FP32 Policy graph, loads only
    the matching model weights from the fake-quant state dict, ignores
-   DOPT-only `.quant_op.*` state, and exports ONNX using the DA3-style legacy tracer:
-   `torch.no_grad()`, evaluation mode, and opset 17.
-   `dynamo=False` is explicit so the behavior is stable across PyTorch
-   versions. No fake-quant arithmetic, Quant, or Dequant nodes are intentionally
+   DOPT-only `.quant_op.*` state, and exports ONNX using PyTorch's dynamo
+   exporter in evaluation mode with opset 18. No fake-quant arithmetic,
+   Quant, or Dequant nodes are intentionally
    included in the ONNX; deployment quantization remains in `quant_params_v2`
-   and is applied by the downstream ONNX-to-OM flow. PyTorch legacy constant
-   folding is disabled because it mixes tracer-created CPU constants with the
-   CUDA graph; after serialization, `onnxslim` performs device-independent
-   constant folding and graph simplification. External tensors are then
-   repacked into one `.onnx.data` file. Any FP16/BF16 initializer fails
-   validation.
+   and is applied by the downstream ONNX-to-OM flow. After serialization,
+   `onnxslim` performs additional constant folding and graph simplification.
+   External tensors are then repacked into one `.onnx.data` file. Any
+   FP16/BF16 initializer fails validation.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting clean ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -150,9 +149,11 @@ def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
         if entry.key == "location"
     }
     data_path = model_path.with_suffix(model_path.suffix + ".data")
-    data_path.unlink(missing_ok=True)
 
+    # Dynamo may already use the exact final ``.onnx.data`` name. Load every
+    # external tensor into the ModelProto before removing that source file.
     model = onnx.load_model(str(model_path), load_external_data=True)
+    data_path.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=f".{model_path.name}.consolidated-",
         suffix=model_path.suffix,
@@ -251,7 +252,7 @@ def main() -> None:
     parser.add_argument("--conditioning-fps", type=float, default=5.0)
     parser.add_argument("--resolution", default="480")
     parser.add_argument("--domain-name", default="droid_lerobot")
-    parser.add_argument("--opset-version", type=int, default=17)
+    parser.add_argument("--opset-version", type=int, default=18)
     parser.add_argument(
         "--external-data-mode",
         choices=("single", "sharded"),
@@ -259,8 +260,6 @@ def main() -> None:
         help="Consolidate all external tensors into one .onnx.data file by default.",
     )
     args = parser.parse_args()
-    os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
     if not torch.cuda.is_available():
         raise RuntimeError("Cosmos3 Policy ONNX export requires CUDA")
     if not args.quant_config.is_file():
@@ -306,7 +305,7 @@ def main() -> None:
     _audit_export_tensor_devices(wrapper, dummy_inputs, device)
     output_names = ("vision_velocity", "action_velocity")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    print("Using ONNX exporter: legacy (dynamo=False)")
+    print("Using ONNX exporter: dynamo=True")
 
     with torch.no_grad():
         reference_outputs = wrapper(*dummy_inputs)
@@ -315,18 +314,13 @@ def main() -> None:
             dummy_inputs,
             str(args.output),
             export_params=True,
-            # The legacy JIT pass synthesizes CPU shape/axis constants while
-            # tracing this CUDA graph, then tries to execute mixed-device
-            # constant subgraphs. Serialize first and let onnxslim perform
-            # device-independent constant folding below.
-            do_constant_folding=False,
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
             training=torch.onnx.TrainingMode.EVAL,
-            # Keep DA3's TorchScript/legacy tracing behavior across PyTorch
-            # versions whose default exporter may differ.
-            dynamo=False,
+            dynamo=True,
+            external_data=True,
+            report=True,
         )
 
     import onnx
@@ -355,9 +349,9 @@ def main() -> None:
         "inputs": _shape_manifest(input_names, dummy_inputs),
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
-        "onnx_exporter": "legacy",
+        "onnx_exporter": "dynamo",
         "onnx_simplified": True,
-        "constant_folding": "onnxslim_after_legacy_export",
+        "constant_folding": "dynamo_exporter_and_onnxslim",
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
