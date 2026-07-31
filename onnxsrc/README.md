@@ -25,7 +25,9 @@ sampler, CFG loop, or action postprocessing.
    graph fails before ONNX serialization. Immediately after serialization,
    `onnxslim` performs device-independent constant folding and graph
    simplification, after which external tensors are repacked into one
-   `.onnx.data` file.
+   `.onnx.data` file. If simplification leaves a shared FP16 constant whose
+   consumers are all `Cast(to=FLOAT)`, the constant is safely promoted to
+   FP32; any other FP16/BF16 initializer still fails validation.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16

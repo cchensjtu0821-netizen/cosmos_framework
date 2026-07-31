@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from cosmos_framework.onnxsrc.cosmos3_quantize import _import_dopt, _load_fixed_policy
@@ -179,6 +180,75 @@ def _simplify_onnx_in_place(model_path: Path, onnx: Any) -> None:
     print(f"Folded constants and simplified ONNX in place: {model_path}")
 
 
+def _promote_fp16_initializers_cast_only_to_fp32(model_path: Path, onnx: Any) -> list[str]:
+    """Promote shared FP16 constants whose consumers all cast them to FP32."""
+    model = onnx.load_model(str(model_path), load_external_data=True)
+    consumers: dict[str, list[Any]] = {}
+    for node in model.graph.node:
+        for input_name in node.input:
+            consumers.setdefault(input_name, []).append(node)
+
+    promoted: list[str] = []
+    for initializer in model.graph.initializer:
+        if initializer.data_type != onnx.TensorProto.FLOAT16:
+            continue
+        initializer_consumers = consumers.get(initializer.name, [])
+        if not initializer_consumers:
+            continue
+        if not all(
+            node.op_type == "Cast"
+            and any(
+                attribute.name == "to"
+                and attribute.i == onnx.TensorProto.FLOAT
+                for attribute in node.attribute
+            )
+            for node in initializer_consumers
+        ):
+            continue
+
+        values = onnx.numpy_helper.to_array(initializer).astype(np.float32)
+        replacement = onnx.numpy_helper.from_array(values, name=initializer.name)
+        initializer.CopyFrom(replacement)
+        promoted.append(initializer.name)
+
+    if not promoted:
+        return promoted
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{model_path.name}.fp32-constants-",
+        suffix=model_path.suffix,
+        dir=model_path.parent,
+        delete=False,
+    ) as temporary_file:
+        temporary_model_path = Path(temporary_file.name)
+    temporary_model_path.unlink()
+    temporary_data_path = temporary_model_path.with_suffix(
+        temporary_model_path.suffix + ".data"
+    )
+    try:
+        onnx.save_model(
+            model,
+            str(temporary_model_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=temporary_data_path.name,
+            size_threshold=1024 * 1024,
+            convert_attribute=True,
+        )
+        onnx.checker.check_model(str(temporary_model_path))
+        temporary_model_path.replace(model_path)
+        _consolidate_external_data(model_path, onnx)
+    finally:
+        temporary_model_path.unlink(missing_ok=True)
+        temporary_data_path.unlink(missing_ok=True)
+
+    print(
+        "Promoted FP16 constants consumed only by Cast(to=FLOAT): "
+        + ", ".join(promoted)
+    )
+    return promoted
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", required=True)
@@ -283,6 +353,9 @@ def main() -> None:
     _simplify_onnx_in_place(args.output, onnx)
     if args.external_data_mode == "single":
         external_data_path = args.output.with_suffix(args.output.suffix + ".data")
+    promoted_fp16_initializers = _promote_fp16_initializers_cast_only_to_fp32(
+        args.output, onnx
+    )
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
@@ -302,6 +375,7 @@ def main() -> None:
         "onnx_exporter": "legacy",
         "onnx_simplified": True,
         "constant_folding": "onnxslim",
+        "promoted_fp16_cast_only_initializers": promoted_fp16_initializers,
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
