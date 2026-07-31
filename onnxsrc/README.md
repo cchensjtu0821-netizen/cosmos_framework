@@ -16,9 +16,10 @@ sampler, CFG loop, or action postprocessing.
    encrypted quant file.
 4. `convert_cosmos3_to_onnx.py` reconstructs the same DOPT graph, loads the
    fake-quant state dict, and exports ONNX with the same dynamo exporter used
-   by the validated Policy rewrite. DOPT scalar configuration buffers used by
-   Python branches (`bit`, `unsigned_quant`, and related flags) are frozen into
-   Python scalars before capture; fake-quant arithmetic remains in the graph.
+   by the validated Policy rewrite. DOPT's tensor-valued `bit` configuration
+   used by Python branches is frozen into a Python scalar before capture;
+   other DOPT buffers remain tensors and fake-quant arithmetic remains in the
+   graph.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16

@@ -60,14 +60,12 @@ def _audit_export_tensor_devices(
 
 
 def _freeze_dopt_scalar_controls(model: torch.nn.Module) -> list[str]:
-    """Convert DOPT configuration buffers used in Python branches to scalars."""
-    control_names = {
-        "bit",
-        "unsigned_quant",
-        "per_channel",
-        "group_size",
-        "reserve_bit",
-    }
+    """Freeze only DOPT's tensor-valued ``bit`` branch control.
+
+    Other scalar-looking buffers are intentionally left as tensors: DOPT's
+    eager forward calls tensor methods on values such as ``unsigned_quant``.
+    """
+    control_names = {"bit"}
     frozen: list[str] = []
     for module_name, module in model.named_modules():
         for name in control_names & module._buffers.keys():
