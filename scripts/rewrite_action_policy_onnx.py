@@ -172,6 +172,41 @@ def _add_initializer(graph: Any, name: str, value: np.ndarray, onnx: Any) -> str
     return name
 
 
+def _inline_small_external_constants(
+    model_path: Path,
+    graph: Any,
+    onnx: Any,
+    *,
+    max_bytes: int = 1024 * 1024,
+) -> int:
+    """Materialize small Constant attributes needed by path-based shape inference."""
+    count = 0
+    for node in graph.node:
+        if node.op_type != "Constant":
+            continue
+        for attribute in node.attribute:
+            if attribute.name != "value" or not attribute.HasField("t"):
+                continue
+            tensor = attribute.t
+            if not onnx.external_data_helper.uses_external_data(tensor):
+                continue
+            dtype = onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type)
+            element_count = int(np.prod(tensor.dims, dtype=np.int64)) if tensor.dims else 1
+            if element_count * np.dtype(dtype).itemsize > max_bytes:
+                continue
+            value = onnx.numpy_helper.to_array(
+                tensor,
+                base_dir=str(model_path.parent),
+            )
+            replacement = onnx.numpy_helper.from_array(
+                np.ascontiguousarray(value),
+                name=tensor.name,
+            )
+            tensor.CopyFrom(replacement)
+            count += 1
+    return count
+
+
 def _rewrite_unary_einsum(graph: Any, onnx: Any, changes: list[dict[str, Any]]) -> int:
     count = 0
     for node in graph.node:
@@ -1106,10 +1141,12 @@ def _apply_rewrites(
     keep_scatter_elements: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
     changes: list[dict[str, Any]] = []
+    inlined_external_constants = _inline_small_external_constants(input_path, graph, onnx)
     _freeze_action_domain(graph, domain_id, onnx, changes)
     _externalize_prompt_embedding(input_path, graph, prompt_embedding_table_path, onnx, changes)
     evaluator = ConstantEvaluator(input_path, graph, onnx)
     counts = {
+        "inlined_external_constants": inlined_external_constants,
         "fixed_vision_batch_io": (
             _rewrite_fixed_vision_batch_io(graph, evaluator, onnx, changes)
             if lower_vision_ranks

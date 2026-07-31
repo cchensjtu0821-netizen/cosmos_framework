@@ -27,6 +27,10 @@ sampler, CFG loop, or action postprocessing.
    files rather than changing ONNX graph I/O to INT8. Legacy export shards are
    consolidated by default into one `<model>.onnx.data` file; the source shard
    files are removed only after the consolidated model passes ONNX checker.
+   Constants below 1 MiB remain inline so Slice axes, Reshape shapes, and other
+   control tensors are available to path-based ONNX shape inference. The
+   compatibility rewrite also repairs older exports by inlining small external
+   Constant attributes before rewriting.
 5. The existing Policy compatibility rewrite removes target-unsupported
    operators and lowers vision ranks.
 6. `finalize_onnx.py` assigns every node a unique non-empty name.

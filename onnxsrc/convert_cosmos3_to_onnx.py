@@ -114,7 +114,9 @@ def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
             save_as_external_data=True,
             all_tensors_to_one_file=True,
             location=data_path.name,
-            size_threshold=0,
+            # Keep scalar/shape/axis constants in the ModelProto so ONNX path-
+            # based shape inference can read them without loading external data.
+            size_threshold=1024 * 1024,
             convert_attribute=True,
         )
         onnx.checker.check_model(str(temporary_model_path))
