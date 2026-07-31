@@ -22,7 +22,10 @@ sampler, CFG loop, or action postprocessing.
    is traced along the fixed example-input execution path. Export-time
    constant folding is disabled because TorchScript synthesizes CPU
    shape/axis constants alongside CUDA fake-quant tensors; folding that mixed
-   graph fails before ONNX serialization.
+   graph fails before ONNX serialization. Immediately after serialization,
+   `onnxslim` performs device-independent constant folding and graph
+   simplification, after which external tensors are repacked into one
+   `.onnx.data` file.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16

@@ -137,6 +137,48 @@ def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
     return data_path
 
 
+def _simplify_onnx_in_place(model_path: Path, onnx: Any) -> None:
+    """Fold constants and simplify a large external-data ONNX in place."""
+    try:
+        import onnxslim
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Install onnxslim to fold constants and simplify the exported ONNX"
+        ) from exc
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{model_path.name}.simplified-",
+        suffix=model_path.suffix,
+        dir=model_path.parent,
+        delete=False,
+    ) as temporary_file:
+        simplified_path = Path(temporary_file.name)
+    simplified_path.unlink()
+    try:
+        onnxslim.slim(
+            str(model_path),
+            str(simplified_path),
+            save_as_external_data=True,
+            # In-memory ONNX shape inference cannot serialize this multi-GB
+            # ModelProto. Shape metadata is handled by the rewrite/audit stage.
+            no_shape_infer=True,
+            # Fold ordinary scalar/shape constants without materializing very
+            # large derived tensors inside the ModelProto.
+            size_threshold=1024 * 1024,
+        )
+        onnx.checker.check_model(str(simplified_path))
+        simplified_path.replace(model_path)
+        # onnxslim names external data after its temporary output. Repack it
+        # immediately so the final artifact again has one stable .onnx.data.
+        _consolidate_external_data(model_path, onnx)
+    finally:
+        simplified_path.unlink(missing_ok=True)
+        for temporary_artifact in model_path.parent.glob(f"{simplified_path.name}*"):
+            if temporary_artifact.is_file():
+                temporary_artifact.unlink()
+    print(f"Folded constants and simplified ONNX in place: {model_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", required=True)
@@ -238,6 +280,9 @@ def main() -> None:
     external_data_path = None
     if args.external_data_mode == "single":
         external_data_path = _consolidate_external_data(args.output, onnx)
+    _simplify_onnx_in_place(args.output, onnx)
+    if args.external_data_mode == "single":
+        external_data_path = args.output.with_suffix(args.output.suffix + ".data")
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
@@ -255,6 +300,8 @@ def main() -> None:
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": "legacy",
+        "onnx_simplified": True,
+        "constant_folding": "onnxslim",
         "external_data_mode": args.external_data_mode,
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
