@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,59 @@ def _verify_fp32_graph_io(model_path: Path, onnx: Any) -> dict[str, int]:
             + ", ".join(offenders)
         )
     return counts
+
+
+def _prepare_dummy_inputs(
+    captured_inputs: tuple[torch.Tensor, ...],
+    input_names: tuple[str, ...],
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Create fixed-layout synthetic inputs explicitly on the export device."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    dummy_inputs: list[torch.Tensor] = []
+    random_inputs = {"video_latent", "action_latent"}
+    for name, captured in zip(input_names, captured_inputs, strict=True):
+        if name in random_inputs:
+            value = torch.randn(
+                tuple(captured.shape),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+        else:
+            value = captured.to(device=device)
+            if value.is_floating_point():
+                value = value.float()
+        dummy_inputs.append(value)
+        print(
+            f"dummy input {name}: shape={tuple(value.shape)} "
+            f"dtype={value.dtype} device={value.device}"
+        )
+    return tuple(dummy_inputs)
+
+
+def _verify_no_embedded_quantization(model_path: Path, onnx: Any) -> dict[str, int]:
+    """Reject DOPT fake-quant subgraphs from the clean deployment ONNX."""
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    quant_op_nodes = [
+        node.name for node in model.graph.node if "/quant_op/" in node.name
+    ]
+    explicit_quant_nodes = [
+        node.name or f"<unnamed:{index}>"
+        for index, node in enumerate(model.graph.node)
+        if node.op_type in {"QuantizeLinear", "DequantizeLinear"}
+    ]
+    if quant_op_nodes or explicit_quant_nodes:
+        raise RuntimeError(
+            "Clean FP32 ONNX unexpectedly contains embedded quantization: "
+            f"quant_op_nodes={quant_op_nodes[:20]}, "
+            f"quantize_dequantize_nodes={explicit_quant_nodes[:20]}"
+        )
+    return {
+        "quant_op_nodes": len(quant_op_nodes),
+        "quantize_dequantize_nodes": len(explicit_quant_nodes),
+    }
 
 
 def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
@@ -205,6 +259,7 @@ def main() -> None:
         help="Consolidate all external tensors into one .onnx.data file by default.",
     )
     args = parser.parse_args()
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
     if not torch.cuda.is_available():
         raise RuntimeError("Cosmos3 Policy ONNX export requires CUDA")
@@ -213,7 +268,10 @@ def main() -> None:
     if not args.fakequant_weight.is_file():
         raise FileNotFoundError(f"Fake-quant state dict does not exist: {args.fakequant_weight}")
 
-    service, export_args, packed, inputs = _load_fixed_policy(args)
+    device = torch.device("cuda", torch.cuda.current_device())
+    print(f"Using export device: {device}")
+
+    service, export_args, packed, captured_inputs = _load_fixed_policy(args)
     export_net = service.model.net.float().eval()
     state_dict = torch.load(args.fakequant_weight, map_location="cpu")
     incompatible = export_net.load_state_dict(state_dict, strict=False)
@@ -233,11 +291,9 @@ def main() -> None:
         "Loaded matching FP32 weights from fake-quant checkpoint; ignored "
         f"{len(ignored_quantizer_keys)} DOPT-only quantizer state key(s)"
     )
-    export_net = export_net.to(device=torch.device("cuda"), dtype=torch.float32).eval()
+    export_net = export_net.to(device=device, dtype=torch.float32).eval()
     _install_onnx_attention(export_net)
-    wrapper = PolicyDenoiserOnnxWrapper(export_net, packed).float().eval()
-    float_inputs = tuple(value.float() if value.is_floating_point() else value for value in inputs)
-    _audit_export_tensor_devices(wrapper, float_inputs, torch.device("cuda", torch.cuda.current_device()))
+    wrapper = PolicyDenoiserOnnxWrapper(export_net, packed).float().to(device).eval()
     input_names = (
         "prompt_token_ids",
         "video_latent",
@@ -246,15 +302,17 @@ def main() -> None:
         "action_timestep",
         "action_domain_id",
     )
+    dummy_inputs = _prepare_dummy_inputs(captured_inputs, input_names, device)
+    _audit_export_tensor_devices(wrapper, dummy_inputs, device)
     output_names = ("vision_velocity", "action_velocity")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     print("Using ONNX exporter: legacy (dynamo=False)")
 
     with torch.no_grad():
-        reference_outputs = wrapper(*float_inputs)
+        reference_outputs = wrapper(*dummy_inputs)
         torch.onnx.export(
             wrapper,
-            float_inputs,
+            dummy_inputs,
             str(args.output),
             export_params=True,
             do_constant_folding=True,
@@ -278,17 +336,19 @@ def main() -> None:
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
+    embedded_quantization_counts = _verify_no_embedded_quantization(args.output, onnx)
     print(
         "Verified clean FP32 ONNX initializers: "
         f"forbidden dtype counts={forbidden_float_initializer_counts}"
     )
     print(f"Verified clean ONNX graph I/O dtypes: {graph_io_dtype_counts}")
+    print(f"Verified no embedded quantization nodes: {embedded_quantization_counts}")
     manifest = {
         "scope": "clean FP32 fixed-layout Cosmos3 Policy MoT denoiser with separate DOPT parameters",
         "checkpoint_path": args.checkpoint_path,
         "dopt_config": str(args.quant_config.resolve()),
         "fakequant_weight": str(args.fakequant_weight.resolve()),
-        "inputs": _shape_manifest(input_names, float_inputs),
+        "inputs": _shape_manifest(input_names, dummy_inputs),
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": "legacy",
@@ -298,10 +358,11 @@ def main() -> None:
         "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
         "graph_io_dtype_counts": graph_io_dtype_counts,
+        "embedded_quantization_counts": embedded_quantization_counts,
     }
     manifest_path = args.output.with_suffix(args.output.suffix + ".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-    print(f"Exported fake-quant ONNX: {args.output}")
+    print(f"Exported clean FP32 ONNX: {args.output}")
     print(f"Export manifest: {manifest_path}")
 
 
