@@ -119,12 +119,11 @@ class ConstantEvaluator:
                 axes = values[1].reshape(-1) if len(values) > 1 else _attribute(node, "axes", self.onnx)
                 result = np.squeeze(values[0], axis=tuple(int(x) for x in axes))
             elif node.op_type == "Trilu":
-                upper = (
-                    int(values[1].reshape(-1)[0])
-                    if len(values) > 1
-                    else int(_attribute(node, "upper", self.onnx, 1))
-                )
-                result = np.triu(values[0]) if upper else np.tril(values[0])
+                # ONNX Trilu's optional second input is the diagonal offset k;
+                # triangle direction is controlled independently by `upper`.
+                k = int(values[1].reshape(-1)[0]) if len(values) > 1 else 0
+                upper = int(_attribute(node, "upper", self.onnx, 1))
+                result = np.triu(values[0], k=k) if upper else np.tril(values[0], k=k)
             else:
                 return None
         except (TypeError, ValueError, OverflowError):
