@@ -24,7 +24,9 @@ sampler, CFG loop, or action postprocessing.
    inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16
    initializer remains; INT8 deployment parameters stay in the DOPT quant
-   files rather than changing ONNX graph I/O to INT8.
+   files rather than changing ONNX graph I/O to INT8. Legacy export shards are
+   consolidated by default into one `<model>.onnx.data` file; the source shard
+   files are removed only after the consolidated model passes ONNX checker.
 5. The existing Policy compatibility rewrite removes target-unsupported
    operators and lowers vision ranks.
 6. `finalize_onnx.py` assigns every node a unique non-empty name.

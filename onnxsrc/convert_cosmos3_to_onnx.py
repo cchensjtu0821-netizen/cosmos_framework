@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,54 @@ def _verify_fp32_graph_io(model_path: Path, onnx: Any) -> dict[str, int]:
     return counts
 
 
+def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
+    lightweight_model = onnx.load_model(str(model_path), load_external_data=False)
+    old_locations = {
+        entry.value
+        for tensor in onnx.external_data_helper._get_all_tensors(lightweight_model)
+        for entry in tensor.external_data
+        if entry.key == "location"
+    }
+    data_path = model_path.with_suffix(model_path.suffix + ".data")
+    data_path.unlink(missing_ok=True)
+
+    model = onnx.load_model(str(model_path), load_external_data=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{model_path.name}.consolidated-",
+        suffix=model_path.suffix,
+        dir=model_path.parent,
+        delete=False,
+    ) as temporary_file:
+        temporary_model_path = Path(temporary_file.name)
+    temporary_model_path.unlink()
+    try:
+        onnx.save_model(
+            model,
+            str(temporary_model_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_path.name,
+            size_threshold=0,
+            convert_attribute=True,
+        )
+        onnx.checker.check_model(str(temporary_model_path))
+        temporary_model_path.replace(model_path)
+    finally:
+        temporary_model_path.unlink(missing_ok=True)
+
+    output_directory = model_path.parent.resolve()
+    removed = 0
+    for location in old_locations:
+        old_path = (model_path.parent / location).resolve()
+        if old_path == data_path.resolve() or old_path.parent != output_directory:
+            continue
+        if old_path.is_file():
+            old_path.unlink()
+            removed += 1
+    print(f"Consolidated ONNX external data: {data_path} (removed {removed} old shard file(s))")
+    return data_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", required=True)
@@ -110,6 +159,12 @@ def main() -> None:
         choices=("legacy", "dynamo"),
         default="legacy",
         help="DOPT uses tensor-valued Python control flags, so legacy tracing is the default.",
+    )
+    parser.add_argument(
+        "--external-data-mode",
+        choices=("single", "sharded"),
+        default="single",
+        help="Consolidate all external tensors into one .onnx.data file by default.",
     )
     args = parser.parse_args()
 
@@ -178,6 +233,9 @@ def main() -> None:
 
     import onnx
 
+    external_data_path = None
+    if args.external_data_mode == "single":
+        external_data_path = _consolidate_external_data(args.output, onnx)
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
@@ -195,6 +253,8 @@ def main() -> None:
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
         "onnx_exporter": args.exporter,
+        "external_data_mode": args.external_data_mode,
+        "external_data_path": str(external_data_path.resolve()) if external_data_path is not None else None,
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
         "graph_io_dtype_counts": graph_io_dtype_counts,
     }
