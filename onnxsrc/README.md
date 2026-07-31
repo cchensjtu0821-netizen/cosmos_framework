@@ -15,7 +15,10 @@ sampler, CFG loop, or action postprocessing.
    synthetic tensors, saves the fake-quant state dict, and generates the
    encrypted quant file.
 4. `convert_cosmos3_to_onnx.py` reconstructs the same DOPT graph, loads the
-   fake-quant state dict, and exports ONNX.
+   fake-quant state dict, and exports ONNX. It defaults to PyTorch's legacy
+   tracer because DOPT quantizers use tensor-valued Python control flags such
+   as `if bit == 2.5`, which `torch.export` cannot capture as data-independent
+   control flow.
 5. The existing Policy compatibility rewrite removes target-unsupported
    operators and lowers vision ranks.
 6. `finalize_onnx.py` assigns every node a unique non-empty name.

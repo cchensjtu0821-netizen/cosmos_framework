@@ -36,6 +36,12 @@ def main() -> None:
     parser.add_argument("--resolution", default="480")
     parser.add_argument("--domain-name", default="droid_lerobot")
     parser.add_argument("--opset-version", type=int, default=18)
+    parser.add_argument(
+        "--exporter",
+        choices=("legacy", "dynamo"),
+        default="legacy",
+        help="DOPT uses tensor-valued Python control flags, so legacy tracing is the default.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -82,6 +88,8 @@ def main() -> None:
     )
     output_names = ("vision_velocity", "action_velocity")
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    use_dynamo = args.exporter == "dynamo"
+    print(f"Using ONNX exporter: {args.exporter}")
 
     with torch.inference_mode():
         reference_outputs = wrapper(*float_inputs)
@@ -92,9 +100,9 @@ def main() -> None:
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
-            dynamo=True,
+            dynamo=use_dynamo,
             external_data=True,
-            report=True,
+            report=use_dynamo,
         )
 
     import onnx
@@ -108,6 +116,7 @@ def main() -> None:
         "inputs": _shape_manifest(input_names, float_inputs),
         "outputs": _shape_manifest(output_names, reference_outputs),
         "settings": export_args.model_dump(mode="json"),
+        "onnx_exporter": args.exporter,
     }
     manifest_path = args.output.with_suffix(args.output.suffix + ".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
