@@ -15,13 +15,12 @@ sampler, CFG loop, or action postprocessing.
    synthetic tensors, saves the fake-quant state dict, and generates the
    encrypted quant file.
 4. `convert_cosmos3_to_onnx.py` reconstructs the same DOPT graph, loads the
-   fake-quant state dict, and exports ONNX. It defaults to PyTorch's legacy
-   tracer because DOPT quantizers use tensor-valued Python control flags such
-   as `if bit == 2.5`, which `torch.export` cannot capture as data-independent
-   control flow. Export-time constant folding is disabled because the legacy
-   folder can mix generated CPU constants with CUDA DOPT tensors. A pre-export
-   audit rejects parameters, buffers, unregistered tensor attributes, or
-   inputs found on the wrong device. The resulting fake-quant ONNX keeps the
+   fake-quant state dict, and exports ONNX with the same dynamo exporter used
+   by the validated Policy rewrite. DOPT scalar configuration buffers used by
+   Python branches (`bit`, `unsigned_quant`, and related flags) are frozen into
+   Python scalars before capture; fake-quant arithmetic remains in the graph.
+   A pre-export audit rejects parameters, buffers, unregistered tensor
+   attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16
    initializer remains; INT8 deployment parameters stay in the DOPT quant
    files rather than changing ONNX graph I/O to INT8. Legacy export shards are
