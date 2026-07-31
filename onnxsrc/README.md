@@ -16,10 +16,13 @@ sampler, CFG loop, or action postprocessing.
    encrypted quant file.
 4. `convert_cosmos3_to_onnx.py` reconstructs the same DOPT graph, loads the
    fake-quant state dict, and exports ONNX using the DA3-style legacy tracer:
-   `torch.no_grad()`, evaluation mode, constant folding, and opset 17.
+   `torch.no_grad()`, evaluation mode, and opset 17.
    `dynamo=False` is explicit so the behavior is stable across PyTorch
    versions. DOPT configuration remains untouched and fake-quant arithmetic
-   is traced along the fixed example-input execution path.
+   is traced along the fixed example-input execution path. Export-time
+   constant folding is disabled because TorchScript synthesizes CPU
+   shape/axis constants alongside CUDA fake-quant tensors; folding that mixed
+   graph fails before ONNX serialization.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting fake-quant ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16

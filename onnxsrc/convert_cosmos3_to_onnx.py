@@ -218,7 +218,12 @@ def main() -> None:
             float_inputs,
             str(args.output),
             export_params=True,
-            do_constant_folding=True,
+            # Cosmos3's traced graph contains CUDA tensors plus CPU shape/axis
+            # constants synthesized by the legacy exporter. Its JIT constant
+            # folding pass attempts to evaluate them together and fails with a
+            # mixed-device error. Keep folding disabled during export; later
+            # compatibility rewrites handle graph constants explicitly.
+            do_constant_folding=False,
             input_names=list(input_names),
             output_names=list(output_names),
             opset_version=args.opset_version,
