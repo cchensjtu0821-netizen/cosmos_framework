@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -855,6 +856,30 @@ def _deduplicate_node_names(graph: Any) -> int:
     return renamed
 
 
+def _infer_shapes_in_place(model_path: Path, onnx: Any) -> None:
+    """Infer intermediate tensor metadata without loading external tensor data."""
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{model_path.name}.shape-inference-",
+        suffix=model_path.suffix,
+        dir=model_path.parent,
+        delete=False,
+    ) as temporary_file:
+        inferred_path = Path(temporary_file.name)
+    inferred_path.unlink()
+    try:
+        onnx.shape_inference.infer_shapes_path(
+            str(model_path),
+            str(inferred_path),
+            check_type=True,
+            strict_mode=True,
+            data_prop=False,
+        )
+        onnx.checker.check_model(str(inferred_path))
+        inferred_path.replace(model_path)
+    finally:
+        inferred_path.unlink(missing_ok=True)
+
+
 def _ort_input_dtype(type_name: str) -> Any:
     mapping = {
         "tensor(float)": np.float32,
@@ -1144,6 +1169,7 @@ def rewrite_model(
         keep_scatter_elements=keep_scatter_elements,
     )
     onnx.save_model(model, str(output_path))
+    _infer_shapes_in_place(output_path, onnx)
     onnx.checker.check_model(str(output_path))
 
     compatibility = inspect_model(output_path, DEFAULT_TARGET_OPS, max_rank=4)
