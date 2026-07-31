@@ -196,7 +196,12 @@ def _rewrite_unary_einsum(graph: Any, onnx: Any, changes: list[dict[str, Any]]) 
     return count
 
 
-def _rewrite_constant_of_shape(graph: Any, onnx: Any, changes: list[dict[str, Any]]) -> int:
+def _rewrite_constant_of_shape(
+    model_path: Path,
+    graph: Any,
+    onnx: Any,
+    changes: list[dict[str, Any]],
+) -> int:
     count = 0
     for node in graph.node:
         if node.op_type != "ConstantOfShape":
@@ -205,7 +210,10 @@ def _rewrite_constant_of_shape(graph: Any, onnx: Any, changes: list[dict[str, An
         if tensor is None:
             scalar = np.asarray([0], dtype=np.float32)
         else:
-            scalar = onnx.numpy_helper.to_array(tensor)
+            scalar = onnx.numpy_helper.to_array(
+                tensor,
+                base_dir=str(model_path.parent),
+            )
         scalar_name = _unique_name(graph, f"{node.output[0]}_fill_value")
         _add_initializer(graph, scalar_name, scalar.reshape(1), onnx)
         old_name = node.name
@@ -1115,7 +1123,7 @@ def _apply_rewrites(
             if lower_vision_ranks
             else 0
         ),
-        "constant_of_shape": _rewrite_constant_of_shape(graph, onnx, changes),
+        "constant_of_shape": _rewrite_constant_of_shape(input_path, graph, onnx, changes),
         "constant_gather": _fold_constant_gathers(input_path, graph, evaluator, onnx, changes),
         "scalar_gather": _rewrite_scalar_gathers(graph, evaluator, onnx, changes),
         "scatter_elements": (
