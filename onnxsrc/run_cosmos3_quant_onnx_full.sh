@@ -133,10 +133,11 @@ then
     exit 1
 fi
 
-echo "========== Step 6: normalize and deduplicate ONNX node names =========="
+echo "========== Step 6: normalize names and reject tensor ranks above 4 =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/finalize_onnx.py" \
     --input "${COSMOS3_ONNX_COMPATIBLE}" \
     --output "${COSMOS3_ONNX_FINAL}" \
+    --max-rank 4 \
     --report-path "${COSMOS3_FINALIZE_REPORT}"
 
 echo "========== Step 7: compare quant-file entries with ONNX nodes =========="

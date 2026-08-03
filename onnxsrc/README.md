@@ -38,7 +38,9 @@ sampler, CFG loop, or action postprocessing.
    Constant attributes before rewriting.
 5. The existing Policy compatibility rewrite removes target-unsupported
    operators and lowers vision ranks.
-6. `finalize_onnx.py` assigns every node a unique non-empty name.
+6. `finalize_onnx.py` assigns every node a unique non-empty name and rejects
+   node tensors or graph I/O whose rank exceeds 4. Findings are reported but
+   high-rank nodes are never deleted merely to pass the audit.
 7. `match_quant_params.py` compares quant-file entry names with final ONNX
    node names.
 8. `audit_onnx.py` checks ONNX validity, duplicate/empty names, rank limits,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize ONNX node names and align Gemm names with weight module paths."""
+"""Normalize ONNX node names and reject tensors above the deployment rank limit."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+
+from cosmos_framework.scripts.inspect_action_policy_onnx import inspect_model
 
 
 def _normalized(name: str) -> str:
@@ -38,7 +40,15 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
+    parser.add_argument(
+        "--max-rank",
+        type=int,
+        default=4,
+        help="Fail when a node input/output or graph I/O tensor exceeds this rank.",
+    )
     args = parser.parse_args()
+    if args.max_rank < 0:
+        parser.error("--max-rank must be non-negative")
     if args.input.parent.resolve() != args.output.parent.resolve():
         raise ValueError("Input and output must share a directory so external-data references remain valid")
 
@@ -101,6 +111,8 @@ def main() -> None:
     onnx.checker.check_model(str(args.output))
     counts = Counter(node.name for node in model.graph.node)
     duplicates = sorted(name for name, count in counts.items() if count > 1)
+    rank_audit = inspect_model(args.output, (), args.max_rank)
+    rank_summary = rank_audit["summary"]
     report = {
         "input": str(args.input.resolve()),
         "output": str(args.output.resolve()),
@@ -109,6 +121,11 @@ def main() -> None:
         "renamed_nodes": renamed,
         "empty_names_after": sum(not node.name for node in model.graph.node),
         "duplicate_names_after": duplicates,
+        "max_rank": args.max_rank,
+        "high_rank_node_count": rank_summary["high_rank_node_count"],
+        "high_rank_nodes": rank_audit["high_rank_nodes"],
+        "high_rank_graph_io_count": rank_summary["high_rank_graph_io_count"],
+        "high_rank_graph_io": rank_audit["high_rank_graph_io"],
         "gemm_nodes": gemm_nodes,
         "gemm_weight_renamed": gemm_weight_renamed,
         "gemm_weight_mappings": gemm_weight_mappings,
@@ -116,6 +133,13 @@ def main() -> None:
     }
     args.report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(report, indent=2, ensure_ascii=False))
+    if (
+        report["empty_names_after"]
+        or report["duplicate_names_after"]
+        or report["high_rank_node_count"]
+        or report["high_rank_graph_io_count"]
+    ):
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
