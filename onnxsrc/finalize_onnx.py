@@ -324,6 +324,175 @@ def _lower_fixed_gather_nd(graph, resolve, onnx) -> tuple[int, int, list[str]]:
     return contiguous_count, segmented_count, unresolved
 
 
+def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[str]]:
+    """Remove explicit none reductions and lower contiguous ScatterND(add)."""
+    import numpy as np
+
+    shapes = _shape_map(graph)
+    element_types = _element_type_map(graph)
+    names = {
+        name
+        for node in graph.node
+        for name in [node.name, *node.input, *node.output]
+        if name
+    }
+    names.update(tensor.name for tensor in graph.initializer)
+
+    def unique(base: str) -> str:
+        candidate = base
+        suffix = 1
+        while candidate in names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        names.add(candidate)
+        return candidate
+
+    scalar_cache: dict[int, str] = {}
+
+    def scalar(value: int) -> str:
+        if value in scalar_cache:
+            return scalar_cache[value]
+        name = unique(f"omg_scatter_slice_{value}")
+        graph.initializer.append(
+            onnx.numpy_helper.from_array(np.asarray([value], dtype=np.int64), name=name)
+        )
+        scalar_cache[value] = name
+        return name
+
+    axis = scalar(0)
+    step = scalar(1)
+    removed_none = 0
+    lowered_add = 0
+    unresolved: list[str] = []
+
+    for node in list(graph.node):
+        if node.op_type != "ScatterND":
+            continue
+        reduction_index = next(
+            (index for index, attribute in enumerate(node.attribute) if attribute.name == "reduction"),
+            None,
+        )
+        if reduction_index is None:
+            continue
+        reduction = node.attribute[reduction_index].s.decode("utf-8")
+        if reduction in {"", "none"}:
+            del node.attribute[reduction_index]
+            removed_none += 1
+            continue
+        if reduction != "add" or len(node.input) < 3 or not node.output:
+            unresolved.append(node.name)
+            continue
+
+        data_name, indices_name, updates_name = node.input[:3]
+        data_shape = shapes.get(data_name)
+        updates_shape = shapes.get(updates_name)
+        element_type = element_types.get(data_name)
+        indices = resolve(indices_name)
+        if (
+            data_shape is None
+            or updates_shape is None
+            or element_type is None
+            or indices is None
+            or indices.ndim != 2
+            or indices.shape[1] != 1
+        ):
+            unresolved.append(node.name)
+            continue
+        rows = indices[:, 0].astype(np.int64)
+        if (
+            rows.size == 0
+            or not np.array_equal(rows, np.arange(rows[0], rows[0] + rows.size))
+            or tuple(updates_shape) != (int(rows.size), *data_shape[1:])
+            or int(rows[0]) < 0
+            or int(rows[-1]) >= data_shape[0]
+        ):
+            unresolved.append(node.name)
+            continue
+
+        start = int(rows[0])
+        end = int(rows[-1]) + 1
+        prefix = node.name or f"scatternd_add_{list(graph.node).index(node)}"
+        node_index = list(graph.node).index(node)
+        replacement = []
+        concat_inputs: list[str] = []
+
+        if start:
+            prefix_output = unique(f"{node.output[0]}_prefix")
+            replacement.append(
+                onnx.helper.make_node(
+                    "Slice",
+                    [data_name, scalar(0), scalar(start), axis, step],
+                    [prefix_output],
+                    name=unique(f"{prefix}_prefix_slice"),
+                )
+            )
+            graph.value_info.append(
+                onnx.helper.make_tensor_value_info(
+                    prefix_output, element_type, [start, *data_shape[1:]]
+                )
+            )
+            concat_inputs.append(prefix_output)
+
+        selected = unique(f"{node.output[0]}_selected_base")
+        updated = unique(f"{node.output[0]}_updated")
+        replacement.extend(
+            [
+                onnx.helper.make_node(
+                    "Slice",
+                    [data_name, scalar(start), scalar(end), axis, step],
+                    [selected],
+                    name=unique(f"{prefix}_selected_slice"),
+                ),
+                onnx.helper.make_node(
+                    "Add",
+                    [selected, updates_name],
+                    [updated],
+                    name=unique(f"{prefix}_selected_add"),
+                ),
+            ]
+        )
+        selected_shape = [end - start, *data_shape[1:]]
+        graph.value_info.extend(
+            [
+                onnx.helper.make_tensor_value_info(selected, element_type, selected_shape),
+                onnx.helper.make_tensor_value_info(updated, element_type, selected_shape),
+            ]
+        )
+        concat_inputs.append(updated)
+
+        if end < data_shape[0]:
+            suffix_output = unique(f"{node.output[0]}_suffix")
+            replacement.append(
+                onnx.helper.make_node(
+                    "Slice",
+                    [data_name, scalar(end), scalar(data_shape[0]), axis, step],
+                    [suffix_output],
+                    name=unique(f"{prefix}_suffix_slice"),
+                )
+            )
+            graph.value_info.append(
+                onnx.helper.make_tensor_value_info(
+                    suffix_output, element_type, [data_shape[0] - end, *data_shape[1:]]
+                )
+            )
+            concat_inputs.append(suffix_output)
+
+        replacement.append(
+            onnx.helper.make_node(
+                "Concat",
+                concat_inputs,
+                [node.output[0]],
+                axis=0,
+                name=unique(f"{prefix}_concat"),
+            )
+        )
+        graph.node.remove(node)
+        for offset, replacement_node in enumerate(replacement):
+            graph.node.insert(node_index + offset, replacement_node)
+        lowered_add += 1
+    return removed_none, lowered_add, unresolved
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -351,6 +520,9 @@ def main() -> None:
     )
     lowered_contiguous_gather_nd, lowered_segmented_gather_nd, unresolved_gather_nd = (
         _lower_fixed_gather_nd(model.graph, resolve, onnx)
+    )
+    removed_scatter_nd_none, lowered_scatter_nd_add, unresolved_scatter_nd_reduction = (
+        _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
     )
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     used: set[str] = set()
@@ -425,6 +597,9 @@ def main() -> None:
         "lowered_contiguous_gather_nd_count": lowered_contiguous_gather_nd,
         "lowered_segmented_gather_nd_count": lowered_segmented_gather_nd,
         "unresolved_gather_nd": unresolved_gather_nd,
+        "removed_explicit_scatter_nd_none_count": removed_scatter_nd_none,
+        "lowered_scatter_nd_add_count": lowered_scatter_nd_add,
+        "unresolved_scatter_nd_reduction": unresolved_scatter_nd_reduction,
         "max_rank": args.max_rank,
         "high_rank_node_count": rank_summary["high_rank_node_count"],
         "high_rank_nodes": rank_audit["high_rank_nodes"],
@@ -444,6 +619,7 @@ def main() -> None:
         or report["high_rank_graph_io_count"]
         or report["unresolved_reshape_allowzero"]
         or report["unresolved_gather_nd"]
+        or report["unresolved_scatter_nd_reduction"]
     ):
         raise SystemExit(2)
 
