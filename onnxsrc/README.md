@@ -45,6 +45,9 @@ sampler, CFG loop, or action postprocessing.
    node names.
 8. `audit_onnx.py` checks ONNX validity, duplicate/empty names, rank limits,
    missing shape metadata, graph I/O, and operator counts.
+9. After the strict audit passes, `run_cosmos3_quant_onnx_full.sh` invokes OMG
+   to convert the named ONNX and its external weight data to OMC. Set
+   `COSMOS3_RUN_OMG=0` to stop after ONNX generation and audit.
 
 All paths are supplied through environment variables in
 `run_cosmos3_quant_onnx_full.sh`. Copy that file or override its variables;

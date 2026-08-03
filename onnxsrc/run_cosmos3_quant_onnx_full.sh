@@ -15,6 +15,9 @@ COSMOS3_CONDITION_ACTION_FRAMES="${COSMOS3_CONDITION_ACTION_FRAMES:-0}"
 COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-0}"  # 默认只生成主量化文件
 COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个 .onnx.data
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
+COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转换 OMC
+COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
+COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
 if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
     echo "Cosmos3 repository directory not found: ${COSMOS3_REPO_DIR}" >&2
@@ -69,6 +72,7 @@ COSMOS3_PROMPT_EMBEDDING="${COSMOS3_ONNX_COMPATIBLE}.prompt_embedding.npy"
 COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
 COSMOS3_MATCH_REPORT="${COSMOS3_QUANT_ROOT}/quant_onnx_name_match.json"
 COSMOS3_AUDIT_REPORT="${COSMOS3_QUANT_ROOT}/onnx_audit.json"
+COSMOS3_OMC_OUTPUT="${COSMOS3_OMC_OUTPUT:-${COSMOS3_QUANT_ROOT}/world}"
 
 COMMON_ARGS=(
     --checkpoint-path "${COSMOS3_CHECKPOINT_PATH}"
@@ -156,7 +160,30 @@ python3 "${COSMOS3_ONNX_SRC_DIR}/audit_onnx.py" \
     --max-rank 4 \
     --report-path "${COSMOS3_AUDIT_REPORT}"
 
-echo "========== Step 9: remove reproducible intermediate files =========="
+if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
+    echo "========== Step 9: convert audited ONNX to OMC =========="
+    if [[ ! -x "${COSMOS3_OMG_BIN}" ]]; then
+        echo "OMG executable not found or not executable: ${COSMOS3_OMG_BIN}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${COSMOS3_ONNX_RAW}.data" ]]; then
+        echo "ONNX external weight data not found: ${COSMOS3_ONNX_RAW}.data" >&2
+        exit 1
+    fi
+    "${COSMOS3_OMG_BIN}" \
+        --model="${COSMOS3_ONNX_FINAL}" \
+        --framework=5 \
+        --output="${COSMOS3_OMC_OUTPUT}" \
+        --compress_conf="${COSMOS3_QUANT_PARAMS_FILE}" \
+        --target=omc \
+        --weight="${COSMOS3_ONNX_RAW}.data" \
+        --input_shape="${COSMOS3_OMG_INPUT_SHAPE}" \
+        --input_type="video_latent:FP16;action_latent:FP16;vision_timestep:FP16;action_timestep:FP16;prompt_embeddings:FP16" \
+        --output_type="vision_velocity:FP16;action_velocity:FP16" \
+        --save_weights_as_external_data=true
+fi
+
+echo "========== Step 10: remove reproducible intermediate files =========="
 rm -f -- \
     "${COSMOS3_ONNX_RAW}" \
     "${COSMOS3_ONNX_COMPATIBLE}" \
@@ -174,3 +201,6 @@ echo "ONNX external data: ${COSMOS3_ONNX_RAW}.data"
 echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
 echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"
+if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
+    echo "OMC output prefix: ${COSMOS3_OMC_OUTPUT}"
+fi
