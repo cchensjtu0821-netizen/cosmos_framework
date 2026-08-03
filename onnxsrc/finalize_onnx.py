@@ -91,6 +91,239 @@ def _eliminate_graph_output_identities(graph) -> list[dict[str, object]]:
     return eliminated
 
 
+def _constant_resolver(graph, onnx):
+    import numpy as np
+
+    initializers = {tensor.name: tensor for tensor in graph.initializer}
+    producers = {
+        output: node for node in graph.node for output in node.output if output
+    }
+
+    def resolve(name: str, seen: set[str] | None = None):
+        seen = set() if seen is None else seen
+        if name in seen:
+            return None
+        seen.add(name)
+        tensor = initializers.get(name)
+        if tensor is not None:
+            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                return None
+            return np.asarray(onnx.numpy_helper.to_array(tensor))
+        node = producers.get(name)
+        if node is None:
+            return None
+        if node.op_type in {"Cast", "Identity"} and node.input:
+            return resolve(node.input[0], seen)
+        if node.op_type == "Constant":
+            for attribute in node.attribute:
+                if attribute.name == "value":
+                    return np.asarray(onnx.numpy_helper.to_array(attribute.t))
+        return None
+
+    return resolve
+
+
+def _normalize_safe_reshape_allowzero(graph, resolve) -> tuple[int, list[str]]:
+    normalized = 0
+    unresolved: list[str] = []
+    for node in graph.node:
+        if node.op_type != "Reshape":
+            continue
+        attribute_index = next(
+            (index for index, attribute in enumerate(node.attribute) if attribute.name == "allowzero"),
+            None,
+        )
+        if attribute_index is None or int(node.attribute[attribute_index].i) == 0:
+            continue
+        shape = resolve(node.input[1]) if len(node.input) > 1 else None
+        if shape is None or 0 in shape.reshape(-1).tolist():
+            unresolved.append(node.name)
+            continue
+        del node.attribute[attribute_index]
+        normalized += 1
+    return normalized, unresolved
+
+
+def _shape_map(graph) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    for value in [*graph.input, *graph.output, *graph.value_info]:
+        tensor_type = value.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        dims = tensor_type.shape.dim
+        if all(dim.HasField("dim_value") for dim in dims):
+            shapes[value.name] = tuple(int(dim.dim_value) for dim in dims)
+    for tensor in graph.initializer:
+        shapes[tensor.name] = tuple(int(dim) for dim in tensor.dims)
+    return shapes
+
+
+def _element_type_map(graph) -> dict[str, int]:
+    element_types: dict[str, int] = {}
+    for value in [*graph.input, *graph.output, *graph.value_info]:
+        element_types[value.name] = int(value.type.tensor_type.elem_type)
+    for tensor in graph.initializer:
+        element_types[tensor.name] = int(tensor.data_type)
+    return element_types
+
+
+def _lower_fixed_gather_nd(graph, resolve, onnx) -> tuple[int, int, list[str]]:
+    """Lower fixed GatherND to Slice or flattened Slice+Concat only."""
+    import numpy as np
+
+    shapes = _shape_map(graph)
+    element_types = _element_type_map(graph)
+    names = {
+        name
+        for node in graph.node
+        for name in [node.name, *node.input, *node.output]
+        if name
+    }
+    names.update(tensor.name for tensor in graph.initializer)
+    initializer_cache: dict[tuple[int, ...], str] = {}
+
+    def unique(base: str) -> str:
+        candidate = base
+        suffix = 1
+        while candidate in names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        names.add(candidate)
+        return candidate
+
+    def i64(values: tuple[int, ...], label: str) -> str:
+        cached = initializer_cache.get(values)
+        if cached is not None:
+            return cached
+        name = unique(label)
+        graph.initializer.append(
+            onnx.numpy_helper.from_array(np.asarray(values, dtype=np.int64), name=name)
+        )
+        initializer_cache[values] = name
+        return name
+
+    axes = i64((0,), "omg_slice_axis_0")
+    steps = i64((1,), "omg_slice_step_1")
+    flat_shape = i64((-1,), "omg_flat_shape")
+    contiguous_count = 0
+    segmented_count = 0
+    unresolved: list[str] = []
+
+    for node in list(graph.node):
+        if node.op_type != "GatherND" or len(node.input) < 2 or not node.output:
+            continue
+        indices = resolve(node.input[1])
+        data_shape = shapes.get(node.input[0])
+        if indices is None or data_shape is None or indices.ndim != 2:
+            unresolved.append(node.name)
+            continue
+        indices = indices.astype(np.int64)
+        if indices.shape[1] == 1:
+            rows = indices[:, 0]
+            if rows.size and np.array_equal(rows, np.arange(rows[0], rows[0] + rows.size)):
+                data_input = node.input[0]
+                starts = i64((int(rows[0]),), f"{node.name}_starts")
+                ends = i64((int(rows[-1]) + 1,), f"{node.name}_ends")
+                del node.attribute[:]
+                del node.input[:]
+                node.input.extend([data_input, starts, ends, axes, steps])
+                node.op_type = "Slice"
+                contiguous_count += 1
+                continue
+        if indices.shape[1] != len(data_shape):
+            unresolved.append(node.name)
+            continue
+        try:
+            flat_indices = np.ravel_multi_index(indices.T, data_shape)
+        except ValueError:
+            unresolved.append(node.name)
+            continue
+        if flat_indices.size == 0 or np.any(np.diff(flat_indices) <= 0):
+            unresolved.append(node.name)
+            continue
+
+        runs: list[tuple[int, int]] = []
+        start = previous = int(flat_indices[0])
+        for value in flat_indices[1:]:
+            value = int(value)
+            if value != previous + 1:
+                runs.append((start, previous + 1))
+                start = value
+            previous = value
+        runs.append((start, previous + 1))
+
+        node_index = list(graph.node).index(node)
+        data_input = node.input[0]
+        output_name = node.output[0]
+        element_type = element_types.get(data_input)
+        if element_type is None:
+            unresolved.append(node.name)
+            continue
+        prefix = node.name or f"gathernd_{node_index}"
+        flattened = unique(f"{output_name}_flat")
+        graph.value_info.append(
+            onnx.helper.make_tensor_value_info(flattened, element_type, [int(np.prod(data_shape))])
+        )
+        replacement = [
+            onnx.helper.make_node(
+                "Reshape", [data_input, flat_shape], [flattened], name=unique(f"{prefix}_flatten")
+            )
+        ]
+        pieces: list[str] = []
+        piece_sizes: dict[str, int] = {}
+        for run_index, (run_start, run_end) in enumerate(runs):
+            piece = unique(f"{output_name}_slice_{run_index}")
+            replacement.append(
+                onnx.helper.make_node(
+                    "Slice",
+                    [
+                        flattened,
+                        i64((run_start,), f"omg_slice_start_{run_start}"),
+                        i64((run_end,), f"omg_slice_end_{run_end}"),
+                        axes,
+                        steps,
+                    ],
+                    [piece],
+                    name=unique(f"{prefix}_slice_{run_index}"),
+                )
+            )
+            pieces.append(piece)
+            piece_sizes[piece] = run_end - run_start
+            graph.value_info.append(
+                onnx.helper.make_tensor_value_info(piece, element_type, [run_end - run_start])
+            )
+        level = 0
+        while len(pieces) > 64:
+            grouped: list[str] = []
+            for group_index in range(0, len(pieces), 64):
+                group = pieces[group_index : group_index + 64]
+                merged = unique(f"{output_name}_concat_{level}_{group_index // 64}")
+                replacement.append(
+                    onnx.helper.make_node(
+                        "Concat", group, [merged], axis=0,
+                        name=unique(f"{prefix}_concat_{level}_{group_index // 64}"),
+                    )
+                )
+                group_size = sum(piece_sizes[item] for item in group)
+                piece_sizes[merged] = group_size
+                graph.value_info.append(
+                    onnx.helper.make_tensor_value_info(merged, element_type, [group_size])
+                )
+                grouped.append(merged)
+            pieces = grouped
+            level += 1
+        replacement.append(
+            onnx.helper.make_node(
+                "Concat", pieces, [output_name], axis=0, name=unique(f"{prefix}_concat_final")
+            )
+        )
+        graph.node.remove(node)
+        for offset, replacement_node in enumerate(replacement):
+            graph.node.insert(node_index + offset, replacement_node)
+        segmented_count += 1
+    return contiguous_count, segmented_count, unresolved
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -112,6 +345,13 @@ def main() -> None:
 
     model = onnx.load_model(str(args.input), load_external_data=False)
     eliminated_graph_output_identities = _eliminate_graph_output_identities(model.graph)
+    resolve = _constant_resolver(model.graph, onnx)
+    normalized_reshape_allowzero, unresolved_reshape_allowzero = _normalize_safe_reshape_allowzero(
+        model.graph, resolve
+    )
+    lowered_contiguous_gather_nd, lowered_segmented_gather_nd, unresolved_gather_nd = (
+        _lower_fixed_gather_nd(model.graph, resolve, onnx)
+    )
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     used: set[str] = set()
     empty_before = 0
@@ -180,6 +420,11 @@ def main() -> None:
         "duplicate_names_after": duplicates,
         "eliminated_graph_output_identity_count": len(eliminated_graph_output_identities),
         "eliminated_graph_output_identities": eliminated_graph_output_identities,
+        "normalized_reshape_allowzero_count": normalized_reshape_allowzero,
+        "unresolved_reshape_allowzero": unresolved_reshape_allowzero,
+        "lowered_contiguous_gather_nd_count": lowered_contiguous_gather_nd,
+        "lowered_segmented_gather_nd_count": lowered_segmented_gather_nd,
+        "unresolved_gather_nd": unresolved_gather_nd,
         "max_rank": args.max_rank,
         "high_rank_node_count": rank_summary["high_rank_node_count"],
         "high_rank_nodes": rank_audit["high_rank_nodes"],
@@ -197,6 +442,8 @@ def main() -> None:
         or report["duplicate_names_after"]
         or report["high_rank_node_count"]
         or report["high_rank_graph_io_count"]
+        or report["unresolved_reshape_allowzero"]
+        or report["unresolved_gather_nd"]
     ):
         raise SystemExit(2)
 

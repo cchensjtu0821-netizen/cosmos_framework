@@ -40,9 +40,10 @@ sampler, CFG loop, or action postprocessing.
    operators and lowers vision ranks.
 6. `finalize_onnx.py` assigns every node a unique non-empty name, bypasses
    redundant `Identity` nodes immediately before graph outputs for OMG
-   compatibility, and rejects node tensors or graph I/O whose rank exceeds 4.
-   Findings are reported but high-rank nodes are never deleted merely to pass
-   the audit.
+   compatibility, normalizes safe nonzero `Reshape.allowzero` attributes, and
+   lowers fixed `GatherND` patterns to `Slice`/`Concat`. It also rejects node
+   tensors or graph I/O whose rank exceeds 4. Findings are reported but
+   high-rank nodes are never deleted merely to pass the audit.
 7. `match_quant_params.py` compares quant-file entry names with final ONNX
    node names.
 8. `audit_onnx.py` checks ONNX validity, duplicate/empty names, rank limits,

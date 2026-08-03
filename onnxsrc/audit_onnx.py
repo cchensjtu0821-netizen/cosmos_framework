@@ -37,7 +37,11 @@ def main() -> None:
     duplicate_tensor_producers = {
         name: node_labels for name, node_labels in sorted(producers.items()) if len(node_labels) > 1
     }
-    compatibility = inspect_model(args.model_path, DEFAULT_TARGET_OPS, args.max_rank)
+    compatibility = inspect_model(
+        args.model_path,
+        (*DEFAULT_TARGET_OPS, "GatherND"),
+        args.max_rank,
+    )
     summary = compatibility["summary"]
     report = {
         "model_path": str(args.model_path.resolve()),
