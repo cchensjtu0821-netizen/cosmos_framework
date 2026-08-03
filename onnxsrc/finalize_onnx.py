@@ -35,6 +35,62 @@ def _gemm_weight_name(node, initializer_names: set[str]) -> tuple[str | None, li
     return module_name or None, weight_inputs
 
 
+def _eliminate_graph_output_identities(graph) -> list[dict[str, object]]:
+    """Bypass redundant Identity nodes that directly produce graph outputs."""
+
+    graph_output_names = {value.name for value in graph.output}
+    graph_input_names = {value.name for value in graph.input}
+    initializer_names = {initializer.name for initializer in graph.initializer}
+    consumers: dict[str, list[object]] = {}
+    producers: dict[str, object] = {}
+    for node in graph.node:
+        for input_name in node.input:
+            if input_name:
+                consumers.setdefault(input_name, []).append(node)
+        for output_name in node.output:
+            if output_name:
+                producers[output_name] = node
+
+    eliminated: list[dict[str, object]] = []
+    for node in list(graph.node):
+        if node.op_type != "Identity" or len(node.input) != 1 or len(node.output) != 1:
+            continue
+        source_name = node.input[0]
+        output_name = node.output[0]
+        source_producer = producers.get(source_name)
+        source_consumers = consumers.get(source_name, [])
+        if (
+            output_name not in graph_output_names
+            or source_producer is None
+            or source_name in graph_output_names
+            or source_name in graph_input_names
+            or source_name in initializer_names
+            or len(source_consumers) != 1
+            or source_consumers[0] is not node
+        ):
+            continue
+        producer_output_index = next(
+            (index for index, name in enumerate(source_producer.output) if name == source_name),
+            None,
+        )
+        if producer_output_index is None:
+            continue
+        source_producer.output[producer_output_index] = output_name
+        graph.node.remove(node)
+        for value_info in list(graph.value_info):
+            if value_info.name == source_name:
+                graph.value_info.remove(value_info)
+        eliminated.append(
+            {
+                "identity_name": node.name,
+                "source_tensor": source_name,
+                "graph_output": output_name,
+                "source_producer": source_producer.name,
+            }
+        )
+    return eliminated
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -55,6 +111,7 @@ def main() -> None:
     import onnx
 
     model = onnx.load_model(str(args.input), load_external_data=False)
+    eliminated_graph_output_identities = _eliminate_graph_output_identities(model.graph)
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     used: set[str] = set()
     empty_before = 0
@@ -121,6 +178,8 @@ def main() -> None:
         "renamed_nodes": renamed,
         "empty_names_after": sum(not node.name for node in model.graph.node),
         "duplicate_names_after": duplicates,
+        "eliminated_graph_output_identity_count": len(eliminated_graph_output_identities),
+        "eliminated_graph_output_identities": eliminated_graph_output_identities,
         "max_rank": args.max_rank,
         "high_rank_node_count": rank_summary["high_rank_node_count"],
         "high_rank_nodes": rank_audit["high_rank_nodes"],

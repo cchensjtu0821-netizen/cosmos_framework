@@ -166,17 +166,12 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         echo "OMG executable not found or not executable: ${COSMOS3_OMG_BIN}" >&2
         exit 1
     fi
-    if [[ ! -f "${COSMOS3_ONNX_RAW}.data" ]]; then
-        echo "ONNX external weight data not found: ${COSMOS3_ONNX_RAW}.data" >&2
-        exit 1
-    fi
     "${COSMOS3_OMG_BIN}" \
         --model="${COSMOS3_ONNX_FINAL}" \
         --framework=5 \
         --output="${COSMOS3_OMC_OUTPUT}" \
         --compress_conf="${COSMOS3_QUANT_PARAMS_FILE}" \
         --target=omc \
-        --weight="${COSMOS3_ONNX_RAW}.data" \
         --input_shape="${COSMOS3_OMG_INPUT_SHAPE}" \
         --input_type="video_latent:FP16;action_latent:FP16;vision_timestep:FP16;action_timestep:FP16;prompt_embeddings:FP16" \
         --output_type="vision_velocity:FP16;action_velocity:FP16" \
