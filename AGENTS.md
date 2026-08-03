@@ -22,6 +22,28 @@ This file applies to work under `cosmos_framework/`. Read the repository-root
   preserve numerical behavior and require server-side comparison against the
   original graph.
 
+## Daily Work Logs
+
+- On each calendar day when work is performed in this package, create or
+  update `docs/agent_logs/YYYY-MM-DD.md` using the current local date. Do not
+  create empty logs for days with no work.
+- Keep the log concise and append durable context for each material issue:
+  symptom/error, diagnosis, solution or next action, affected files/commands,
+  validation evidence, and current status.
+- Use explicit status labels: `OPEN`, `INVESTIGATING`, `BLOCKED`, or
+  `RESOLVED`. When an issue is fixed, update its existing entry to `RESOLVED`
+  rather than leaving stale text that still describes it as active.
+- Preserve useful failed approaches when they prevent repeated work, but mark
+  them clearly as rejected or superseded.
+- At the start and end of a work turn, check the current daily log size. When
+  it reaches or exceeds 128 KiB, notify the user and report its path and size.
+  Do not delete, truncate, compress, split, or archive it without the user's
+  decision.
+- Daily logs are repository notes, not generated runtime artifacts. Never put
+  credentials, tokens, private server paths, large command output, model data,
+  or profiling dumps in them. Summarize such material and use placeholders for
+  machine-specific paths.
+
 ## Package Map
 
 | Area | Location | Purpose |
@@ -91,6 +113,17 @@ updates, or final action postprocessing.
 - `ScatterElements(axis=0, reduction=add)` produced by
   `Unsqueeze → Expand → scatter_add` may be rewritten to
   `ScatterND(reduction=add)` using compact `[N, 1]` row indices.
+- That intermediate `ScatterND(reduction=add)` is still not accepted by OMG.
+  During `onnxsrc/finalize_onnx.py`, a validated contiguous axis-0 update is
+  lowered again to `Slice(data) → Add(updates) → Concat(prefix, updated,
+  suffix)`. Only static `[N, 1]` consecutive row indices with matching update
+  shapes are eligible; unresolved reductions must fail finalization.
+- For default overwrite `ScatterND`, remove an explicit `reduction=none`
+  attribute when present. Static, sorted, unique `[N, 1]` row-index patterns
+  with matching update shapes must be lowered to interleaved data/update
+  `Slice` nodes followed by bounded fan-in `Concat`; this avoids OMG's faulty
+  shape propagation for strided-Slice-fed updates. Report every remaining
+  `ScatterND`; do not infer that arbitrary ScatterND layouts are supported.
 - An output file may exist even when the rewrite command ultimately fails:
   `rewrite_action_policy_onnx.py` saves the model before its final compatibility
   audit. Always inspect the command exit status and generated rewrite report.
@@ -113,44 +146,41 @@ When handing off a change, report:
 - expected audit result;
 - numerical equivalence checks still required.
 
-## Active ONNX Worklog — 2026-07-30
+## Active ONNX Worklog — 2026-08-03
 
 The FP32 Edge Policy export and structural rewrites currently reach:
 
 - zero target-unsupported nodes when all rewrites are enabled;
 - zero tensors above rank 4, including graph I/O;
-- finite, exactly equal outputs when both causal `Where` rewriting and vision
-  rank lowering are disabled with `--keep-causal-where --keep-vision-ranks`.
+- finite, numerically equivalent outputs with causal `Where` rewriting and
+  vision rank lowering enabled.
 
-Two numerical-equivalence issues remain:
+The two previously isolated numerical-equivalence issues are resolved:
 
 1. **Causal mask rewrite**
    - Original: `Where(mask, -Inf, attention_scores)`.
-   - Current attempted replacement: `Clip(attention_scores) + causal_bias`.
-   - With the replacement enabled, both rewritten outputs become entirely
-     non-finite while the reference outputs remain finite.
-   - Keeping the original 28 `Where` nodes removes the non-finite outputs.
-   - Do not treat `Clip + Add` as an accepted solution. A future replacement
-     must preserve overwrite semantics even when masked source values are NaN
-     or Inf; fixed unique-index `ScatterND` is the leading candidate.
+   - The rejected `Clip(attention_scores) + causal_bias` approach has been
+     replaced by exact fixed-layout overwrite semantics.
+   - The rewrite broadcasts the causal mask to the statically resolved score
+     shape, gathers only unmasked scores with `GatherND`, and scatters them into
+     an all-`-Inf` initializer with `ScatterND`.
+   - Masked source values are never read or used in arithmetic, so masked NaN
+     or Inf values cannot contaminate the result.
 
 2. **Vision rank lowering**
-   - The rank-6 patchify/unpatchify and rank-5 I/O lowering passes structural
-     inspection but is not numerically equivalent.
-   - With causal `Where` retained but vision rank lowering enabled, observed
-     errors were approximately:
-     `vision_velocity max_abs_error=8.5640602`,
-     `action_velocity max_abs_error=0.082353115`.
-   - With `--keep-vision-ranks`, both outputs are finite and exactly equal:
-     `allclose=True`, `max_abs_error=0`.
-   - Recheck `SpaceToDepth`/`DepthToSpace` channel and patch-element ordering
-     against the original six-dimensional Reshape/Transpose layouts.
+   - Fixed batch-1 rank-5 vision I/O is lowered to rank 4.
+   - Rank-6 patchify is replaced by a rank-4 transpose,
+     `SpaceToDepth`, channels-last transpose, and final reshape.
+   - Rank-6 unpatchify uses the exact inverse with rank-4 reshape, transpose,
+     `DepthToSpace(mode=DCR)`, and output transpose.
+   - The corrected channel depth order is `[p, q, C]`, matching the original
+     `cthpwq -> thwpqc` patchify permutation and its inverse.
 
-This isolation run also left the `ScatterElements -> ScatterND` rewrite enabled
-and still produced exact outputs when the two problematic passes were disabled.
-That is evidence that ScatterElements rewriting is not responsible for the
-currently observed mismatch, though final full-model validation remains
-required after the two issues above are fixed.
+`ScatterElements -> ScatterND` rewriting remains independently validated and
+was not responsible for either historical mismatch. The produced
+`ScatterND(reduction=add)` is only an intermediate ONNX form: finalization must
+lower it to the validated `Slice`/`Add`/`Concat` sequence before OMG/OMC
+conversion.
 
 Useful diagnostic flags:
 
@@ -160,7 +190,8 @@ Useful diagnostic flags:
 --keep-scatter-elements
 ```
 
-Diagnostic outputs are not deployment-compatible. A saved ONNX file is usable
-only after the command exits successfully with `finite=True`,
+The `--keep-*` flags are retained for regression isolation; outputs produced
+with unsupported operators retained are not deployment-compatible. A saved
+ONNX file is usable only after the command exits successfully with `finite=True`,
 `nonfinite=(0,0)`, `allclose=True`, zero unsupported target nodes, and zero
 high-rank nodes/I/O.

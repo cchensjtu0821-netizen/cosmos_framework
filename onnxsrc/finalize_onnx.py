@@ -324,8 +324,10 @@ def _lower_fixed_gather_nd(graph, resolve, onnx) -> tuple[int, int, list[str]]:
     return contiguous_count, segmented_count, unresolved
 
 
-def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[str]]:
-    """Remove explicit none reductions and lower contiguous ScatterND(add)."""
+def _normalize_scatter_nd_for_omg(
+    graph, resolve, onnx
+) -> tuple[int, int, int, list[str], list[dict[str, object]]]:
+    """Lower validated row-wise ScatterND patterns for OMG compatibility."""
     import numpy as np
 
     shapes = _shape_map(graph)
@@ -363,6 +365,7 @@ def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[
     step = scalar(1)
     removed_none = 0
     lowered_add = 0
+    lowered_overwrite = 0
     unresolved: list[str] = []
 
     for node in list(graph.node):
@@ -372,15 +375,22 @@ def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[
             (index for index, attribute in enumerate(node.attribute) if attribute.name == "reduction"),
             None,
         )
-        if reduction_index is None:
-            continue
-        reduction = node.attribute[reduction_index].s.decode("utf-8")
+        reduction = (
+            "none"
+            if reduction_index is None
+            else node.attribute[reduction_index].s.decode("utf-8")
+        )
         if reduction in {"", "none"}:
-            del node.attribute[reduction_index]
-            removed_none += 1
-            continue
-        if reduction != "add" or len(node.input) < 3 or not node.output:
+            if reduction_index is not None:
+                del node.attribute[reduction_index]
+                removed_none += 1
+            reduction = "none"
+        if reduction not in {"add", "none"}:
             unresolved.append(node.name)
+            continue
+        if len(node.input) < 3 or not node.output:
+            if reduction == "add":
+                unresolved.append(node.name)
             continue
 
         data_name, indices_name, updates_name = node.input[:3]
@@ -388,24 +398,150 @@ def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[
         updates_shape = shapes.get(updates_name)
         element_type = element_types.get(data_name)
         indices = resolve(indices_name)
-        if (
+        invalid_common_layout = (
             data_shape is None
             or updates_shape is None
             or element_type is None
             or indices is None
             or indices.ndim != 2
             or indices.shape[1] != 1
-        ):
-            unresolved.append(node.name)
+        )
+        if invalid_common_layout:
+            if reduction == "add":
+                unresolved.append(node.name)
             continue
         rows = indices[:, 0].astype(np.int64)
         if (
             rows.size == 0
-            or not np.array_equal(rows, np.arange(rows[0], rows[0] + rows.size))
             or tuple(updates_shape) != (int(rows.size), *data_shape[1:])
             or int(rows[0]) < 0
             or int(rows[-1]) >= data_shape[0]
         ):
+            if reduction == "add":
+                unresolved.append(node.name)
+            continue
+
+        if reduction == "none":
+            if rows.size > 1 and np.any(np.diff(rows) <= 0):
+                continue
+
+            prefix = node.name or f"scatternd_overwrite_{list(graph.node).index(node)}"
+            node_index = list(graph.node).index(node)
+            replacement = []
+            concat_inputs: list[str] = []
+            piece_sizes: dict[str, int] = {}
+            cursor = 0
+
+            for update_index, row_value in enumerate(rows):
+                row = int(row_value)
+                if cursor < row:
+                    data_piece = unique(f"{node.output[0]}_data_{cursor}_{row}")
+                    replacement.append(
+                        onnx.helper.make_node(
+                            "Slice",
+                            [data_name, scalar(cursor), scalar(row), axis, step],
+                            [data_piece],
+                            name=unique(f"{prefix}_data_slice_{cursor}_{row}"),
+                        )
+                    )
+                    piece_sizes[data_piece] = row - cursor
+                    graph.value_info.append(
+                        onnx.helper.make_tensor_value_info(
+                            data_piece, element_type, [row - cursor, *data_shape[1:]]
+                        )
+                    )
+                    concat_inputs.append(data_piece)
+
+                update_piece = unique(f"{node.output[0]}_update_{update_index}")
+                replacement.append(
+                    onnx.helper.make_node(
+                        "Slice",
+                        [
+                            updates_name,
+                            scalar(update_index),
+                            scalar(update_index + 1),
+                            axis,
+                            step,
+                        ],
+                        [update_piece],
+                        name=unique(f"{prefix}_update_slice_{update_index}"),
+                    )
+                )
+                piece_sizes[update_piece] = 1
+                graph.value_info.append(
+                    onnx.helper.make_tensor_value_info(
+                        update_piece, element_type, [1, *data_shape[1:]]
+                    )
+                )
+                concat_inputs.append(update_piece)
+                cursor = row + 1
+
+            if cursor < data_shape[0]:
+                data_piece = unique(f"{node.output[0]}_data_{cursor}_{data_shape[0]}")
+                replacement.append(
+                    onnx.helper.make_node(
+                        "Slice",
+                        [data_name, scalar(cursor), scalar(data_shape[0]), axis, step],
+                        [data_piece],
+                        name=unique(f"{prefix}_data_slice_{cursor}_{data_shape[0]}"),
+                    )
+                )
+                piece_sizes[data_piece] = data_shape[0] - cursor
+                graph.value_info.append(
+                    onnx.helper.make_tensor_value_info(
+                        data_piece,
+                        element_type,
+                        [data_shape[0] - cursor, *data_shape[1:]],
+                    )
+                )
+                concat_inputs.append(data_piece)
+
+            level = 0
+            while len(concat_inputs) > 64:
+                grouped: list[str] = []
+                for group_index in range(0, len(concat_inputs), 64):
+                    group = concat_inputs[group_index : group_index + 64]
+                    merged = unique(
+                        f"{node.output[0]}_concat_{level}_{group_index // 64}"
+                    )
+                    replacement.append(
+                        onnx.helper.make_node(
+                            "Concat",
+                            group,
+                            [merged],
+                            axis=0,
+                            name=unique(
+                                f"{prefix}_concat_{level}_{group_index // 64}"
+                            ),
+                        )
+                    )
+                    merged_size = sum(piece_sizes[item] for item in group)
+                    piece_sizes[merged] = merged_size
+                    graph.value_info.append(
+                        onnx.helper.make_tensor_value_info(
+                            merged, element_type, [merged_size, *data_shape[1:]]
+                        )
+                    )
+                    grouped.append(merged)
+                concat_inputs = grouped
+                level += 1
+
+            replacement.append(
+                onnx.helper.make_node(
+                    "Concat",
+                    concat_inputs,
+                    [node.output[0]],
+                    axis=0,
+                    name=unique(f"{prefix}_concat_final"),
+                )
+            )
+            graph.node.remove(node)
+            for offset, replacement_node in enumerate(replacement):
+                graph.node.insert(node_index + offset, replacement_node)
+            lowered_overwrite += 1
+            continue
+
+        if not np.array_equal(rows, np.arange(rows[0], rows[0] + rows.size)):
             unresolved.append(node.name)
             continue
 
@@ -490,7 +626,24 @@ def _normalize_scatter_nd_for_omg(graph, resolve, onnx) -> tuple[int, int, list[
         for offset, replacement_node in enumerate(replacement):
             graph.node.insert(node_index + offset, replacement_node)
         lowered_add += 1
-    return removed_none, lowered_add, unresolved
+    remaining = [
+        {
+            "name": node.name,
+            "reduction": next(
+                (
+                    attribute.s.decode("utf-8")
+                    for attribute in node.attribute
+                    if attribute.name == "reduction"
+                ),
+                "none",
+            ),
+            "inputs": list(node.input),
+            "input_shapes": [shapes.get(input_name) for input_name in node.input],
+        }
+        for node in graph.node
+        if node.op_type == "ScatterND"
+    ]
+    return removed_none, lowered_add, lowered_overwrite, unresolved, remaining
 
 
 def main() -> None:
@@ -521,9 +674,13 @@ def main() -> None:
     lowered_contiguous_gather_nd, lowered_segmented_gather_nd, unresolved_gather_nd = (
         _lower_fixed_gather_nd(model.graph, resolve, onnx)
     )
-    removed_scatter_nd_none, lowered_scatter_nd_add, unresolved_scatter_nd_reduction = (
-        _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
-    )
+    (
+        removed_scatter_nd_none,
+        lowered_scatter_nd_add,
+        lowered_scatter_nd_overwrite,
+        unresolved_scatter_nd_reduction,
+        remaining_scatter_nd,
+    ) = _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     used: set[str] = set()
     empty_before = 0
@@ -599,7 +756,10 @@ def main() -> None:
         "unresolved_gather_nd": unresolved_gather_nd,
         "removed_explicit_scatter_nd_none_count": removed_scatter_nd_none,
         "lowered_scatter_nd_add_count": lowered_scatter_nd_add,
+        "lowered_scatter_nd_overwrite_count": lowered_scatter_nd_overwrite,
         "unresolved_scatter_nd_reduction": unresolved_scatter_nd_reduction,
+        "remaining_scatter_nd_count": len(remaining_scatter_nd),
+        "remaining_scatter_nd": remaining_scatter_nd,
         "max_rank": args.max_rank,
         "high_rank_node_count": rank_summary["high_rank_node_count"],
         "high_rank_nodes": rank_audit["high_rank_nodes"],

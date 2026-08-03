@@ -44,6 +44,11 @@ sampler, CFG loop, or action postprocessing.
    lowers fixed `GatherND` patterns to `Slice`/`Concat`. It removes explicit
    default `ScatterND(reduction=none)` attributes and lowers validated
    contiguous `ScatterND(reduction=add)` patterns to `Slice`/`Add`/`Concat`.
+   It also lowers default-overwrite `ScatterND` with static, sorted, unique
+   `[N, 1]` row indices to interleaved data/update `Slice` nodes and bounded
+   fan-in `Concat` nodes. The report lists every remaining `ScatterND` so later
+   OMG failures can be correlated without assuming all ScatterND layouts are
+   interchangeable.
    It also rejects node tensors or graph I/O whose rank exceeds 4. Findings are
    reported but high-rank nodes are never deleted merely to pass the audit.
 7. `match_quant_params.py` compares quant-file entry names with final ONNX
