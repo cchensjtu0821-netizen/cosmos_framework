@@ -38,15 +38,117 @@ tokenizer、VAE encoder、UniPC sampler、CFG、latent 更新和 action 后处�
 第一阶段的审计入口是 `inspect_action_policy_onnx.py`，默认目标集合就是以下
 五类算子。实现入口是 `rewrite_action_policy_onnx.py`。
 
-| 原算子 | 原图中的用途/数据 | 第一阶段处理 | 等价性和约束 | 改写后主要算子 |
-| --- | --- | --- | --- | --- |
-| `ConstantOfShape` | 按固定 shape 生成常量张量；shape 或 value 可能位于 external data | 解析固定 shape 和填充值，增加标量 initializer，以 `Expand` 生成目标张量 | 固定 shape 下严格等价；无法解析的节点不能假装已处理 | `Expand` |
-| `Einsum` | exporter 生成的单输入维度置换，例如 patchify/unpatchify 周边 permutation | 仅对“输入/输出 label 一一对应、无求和”的 unary equation 计算 `perm`，替换为 `Transpose` | 只接受纯 permutation pattern，局部严格等价 | `Transpose` |
-| `Gather` | 常量索引、标量索引、axis-0 vector 索引，以及 prompt embedding lookup | 常量结果折叠为 initializer；标量索引改为 `Slice + Squeeze`；axis-0 固定 vector 索引改成 `[N,1]` 索引的 `GatherND`；prompt token embedding 移到宿主侧 | 前三类为固定索引严格等价；宿主必须用导出的原 embedding table 生成 `prompt_embeddings` | initializer、`Slice`、`Squeeze`、`GatherND`；prompt 输入为 `[108,2048]` embedding |
-| `ScatterElements` | `Unsqueeze -> Expand -> scatter_add` 形成的 axis-0 行累加；更新行数为 `N` | 去掉 expanded 全坐标索引，构造紧凑 `[N,1]` 行索引，改成 `ScatterND(reduction=add)` | 只处理 `axis=0`、`reduction=add` 且索引/updates shape 可证明匹配的 pattern | 中间形式 `ScatterND(reduction=add)` |
-| `Where` | 一类是固定 layout 的 shape/选择逻辑；另一类是 causal attention mask：`Where(mask, -Inf, scores)` | 常量 `Where` 直接折叠；causal `Where` 将 mask 广播到静态 score shape，只 `GatherND` 未遮挡 score，再写入全 `-Inf` initializer | 保留分支隔离：被 mask 的 NaN/Inf 不参与读取或算术；早期 `Clip + bias` 方案已拒绝 | causal 路径为 `GatherND + ScatterND` overwrite |
+### 3.1 `ConstantOfShape`
 
-### 3.1 第一阶段同时发生但不属于“五类缺失算子”的处理
+1. **为什么处理**：最初明确给出的不支持算子之一，兼容图中不能残留。
+2. **原始作用**：输入是 shape tensor，输出用固定标量填满该 shape。shape 或
+   `value` attribute 引用的数据可能存放在 ONNX external data 中。
+3. **怎么处理**：解析静态 shape 和填充值；把填充值保存成 scalar initializer；
+   使用该 scalar 和原 shape 输入构造 `Expand`。
+4. **算子变化**：`ConstantOfShape -> scalar initializer + Expand`。
+5. **处理条件**：shape 和填充值必须能静态解析；无法解析就不能改写，也不能把
+   节点直接删除。
+6. **语义**：在固定 shape 下为局部严格等价。
+
+### 3.2 `Einsum`
+
+1. **为什么处理**：最初明确给出的不支持算子之一。
+2. **原始作用**：exporter 在 patchify/unpatchify 周边生成单输入 unary `Einsum`，
+   实际只做维度置换，没有乘加或 reduction。
+3. **怎么处理**：解析 equation；仅当输入 label 和输出 label 一一对应、无重复、
+   无消失 label 时，根据 label 顺序计算 `perm`。
+4. **算子变化**：`Einsum(equation) -> Transpose(perm)`。
+5. **处理条件**：只改写纯 permutation equation；一般多输入或含求和的 `Einsum`
+   不套用该规则。
+6. **语义**：满足上述条件时局部严格等价。
+
+### 3.3 `Gather`
+
+`Gather` 不是用同一种方式全部替换，而是按数据来源和索引布局分四类处理。
+
+#### 3.3.1 常量数据、常量索引
+
+1. **原 pattern**：`Gather(initializer, constant_indices)`。
+2. **怎么处理**：离线计算 Gather 结果，把结果直接保存为 initializer，删除节点。
+3. **算子变化**：`Gather -> initializer`。
+
+#### 3.3.2 单个标量索引
+
+1. **原 pattern**：indices 只有一个元素，axis 和 index 可静态解析。
+2. **怎么处理**：先用 `[index:index+1]` 做 `Slice`，再在相同 axis 上 `Squeeze`。
+3. **算子变化**：`Gather -> Slice + Squeeze`。
+
+#### 3.3.3 axis-0 固定向量索引
+
+1. **原 pattern**：`Gather(axis=0)`，indices 是固定一维向量，共 `N` 个索引。
+2. **怎么处理**：把 indices reshape 成紧凑的 `[N,1]` int64 坐标。
+3. **算子变化**：`Gather(axis=0) -> GatherND(indices=[N,1])`。
+4. **后续影响**：这个 `GatherND` 是第一阶段的中间替代算子；OMG 仍有兼容问题，
+   所以在第二阶段 base→v2 又被继续改成 `Slice/Concat/Reshape`。
+
+#### 3.3.4 prompt embedding lookup
+
+1. **原 pattern**：用 `prompt_token_ids` 从模型 embedding table 做 `Gather`。
+2. **怎么处理**：导出原 embedding table 为 sidecar；图输入从 token IDs 改成宿主
+   已完成 lookup 的 `prompt_embeddings`。
+3. **算子/接口变化**：删除图内 embedding `Gather`；宿主提供固定布局
+   `[108,2048]` 的 embedding。
+4. **处理条件**：宿主必须使用导出的同一张 embedding table，否则不等价。
+
+上述四类处理的共同原因都是 `Gather` 属于最初不支持列表。前三类在固定索引下
+严格等价；第四类是接口等价。
+
+### 3.4 `ScatterElements`
+
+1. **为什么处理**：最初明确给出的不支持算子之一。
+2. **原始 pattern**：`Unsqueeze -> Expand -> ScatterElements`，其中
+   `axis=0`、`reduction=add`；expanded indices 描述对 `N` 行的累加更新。
+3. **怎么处理**：不再保留与 updates 同形状的 expanded indices；解析每个更新
+   对应的 axis-0 行号，生成紧凑 `[N,1]` int64 row indices。
+4. **算子变化**：
+
+   ```text
+   ScatterElements(axis=0, reduction=add, expanded_indices)
+     -> ScatterND(reduction=add, row_indices=[N,1])
+   ```
+
+5. **处理条件**：必须能证明原节点是 axis-0 add、每个 expanded index 与紧凑
+   row index 表达同一批更新，并且 data/indices/updates shape 匹配。
+6. **后续影响**：`ScatterND(reduction=add)` 仍不被 OMG 接受，所以第二阶段
+   v2→v3 再将其中 2 个改成 `Slice + Add + Concat`。
+
+### 3.5 `Where`
+
+`Where` 分为固定常量选择和 causal mask 两类。
+
+#### 3.5.1 固定 layout 的常量 `Where`
+
+1. **原 pattern**：condition、true branch、false branch 都可在固定配置下求值。
+2. **怎么处理**：离线计算完整输出并保存为 initializer。
+3. **算子变化**：`Where -> initializer`。
+
+#### 3.5.2 causal attention `Where`
+
+1. **原 pattern**：`Where(mask, -Inf, attention_scores)`。
+2. **不能使用的方案**：早期 `Clip(scores) + causal_bias` 会读取并计算被 mask 的
+   NaN/Inf，破坏 `Where` 的分支隔离语义，已拒绝。
+3. **最终处理**：把 causal mask 广播到静态 score shape；仅生成未遮挡位置的完整
+   坐标；用 `GatherND` 只读取未遮挡 scores；以全 `-Inf` initializer 为底板，用
+   overwrite `ScatterND` 写回未遮挡值。
+4. **算子变化**：
+
+   ```text
+   Where(mask, -Inf, scores)
+     -> GatherND(unmasked scores)
+     -> ScatterND(overwrite into all--Inf initializer)
+   ```
+
+5. **语义**：masked source value 从未被读取或用于算术，因此 NaN/Inf 不会污染
+   输出，保持原 `Where` 的分支隔离语义。
+6. **后续影响**：产生的固定 `GatherND` 在第二阶段 base→v2 被继续 lower；部分
+   overwrite `ScatterND` 在 v3→v4 被继续 lower。
+
+### 3.6 第一阶段辅助处理：不属于五类缺失算子
 
 这些处理是固定部署接口、rank 限制或验证要求引入的，不能误归因为最初的
 五类算子列表：
@@ -60,7 +162,7 @@ tokenizer、VAE encoder、UniPC sampler、CFG、latent 更新和 action 后处�
   逆变换。通道次序必须为 `[p,q,C]`。
 - 所有 `GatherND`/`ScatterND` indices 规范为 `int64`，并去重节点名。
 
-### 3.2 第一阶段数值验证结论
+### 3.7 第一阶段数值验证结论
 
 服务器历史验证表明，在 causal `Where` 精确改写和 vision rank lowering 修正后，
 输出满足 `finite=True`、`nonfinite=(0,0)`、`allclose=True`，并达到五类目标算子
@@ -70,35 +172,177 @@ tokenizer、VAE encoder、UniPC sampler、CFG、latent 更新和 action 后处�
 ## 4. 第二阶段：OMG/OMC 实测问题触发的改写
 
 第二阶段并不是继续处理最初五类算子，而是处理第一阶段产生的替代算子以及
-OMG 自身的 shape inference/算子实现限制。
+OMG 自身的 shape inference/算子实现限制。本节只按文件版本变化逐段说明。
 
-| 触发点 | OMG/OMC 现象 | 已确认数据 | 第二阶段处理 | 状态 |
-| --- | --- | --- | --- | --- |
-| 固定 `GatherND` | 为避免 OMG 对这些固定索引路径的兼容问题而继续 lower；base 中有 36 个 | base: `GatherND=36`；v2: `GatherND=0` | 连续索引直接改 `Slice`；一般固定 full-coordinate 索引先 flatten，再按连续段生成 `Slice`，用 bounded-fan-in `Concat` 合并，必要时 `Reshape` | 已完成结构改写；仍需每版 OMG/数值验证 |
-| `ScatterND(reduction=add)` | OMG 不接受由第一阶段 `ScatterElements` lowering 产生的 add reduction | 共 2 个；静态 `[N,1]` 连续 axis-0 行索引，updates shape 匹配 | `Slice(data) -> Add(updates) -> Concat(prefix, updated, suffix)`；未满足条件的 reduction 必须令 finalization 失败 | v3 已消除这 2 个 |
-| overwrite `ScatterND` | `node_ScatterND_239` 报 `indices.dim[0]=20`、`updates.dim[0]=19` 并终止 IR 生成 | ONNX 实际为 data `[64,3201,1]`、indices `[20,1]`、updates `[20,3201,1]`；indices=`[1,4,7,...,55,58]`。上游 Slice 是 `start=1,end=60,step=3,dim=64`，按 ONNX 语义应有 20 行 | 对静态、排序、唯一、边界内的 `[N,1]` 行索引，保留 data 未更新区间并插入 updates 的单行 `Slice`，最后用 fan-in<=64 的分层 `Concat`；显式 `reduction=none` 属性先移除 | 诊断为 OMG strided-Slice shape inference 偏差；v4 消除 124 个，仍留 28 个非适配 layout |
-| `Mul` 广播 | overwrite ScatterND 问题绕过后，v4 的 OMG 在 `node_mul_23` 报 124 与 128 无法广播 | 四条已 lower 的 GatherND 路径均被 OMG constant-fold 为 feature width `124` 的 Slice；`node_mul_23` 另一输入要求 `128`；`scaleShape[0]=3093=3201-108` 是 sequence 后半段长度 | 仅当两输入 fully-static、同 rank、且恰有一个 axis 从 1 广播到目标值时，显式插入 `Expand -> Mul`。若实际是 124 对 128，不补零、不伪造数值，保持未处理并继续诊断 | `INVESTIGATING`；这是 v4 的终止错误。现有 v1-v4 均为 `Expand=118`，不能声称已包含或解决此改写 |
-| external weight 参数 | OMG 命令未传分离的 ONNX external data | 权重默认 `${COSMOS3_ONNX_RAW}.data` | 脚本检查文件存在并传 `--weight` | `RESOLVED`；这是调用参数，不是算子改写 |
+### 4.1 base：第二阶段的起点
 
-此外，最终化阶段还会处理 `Reshape.allowzero`、graph-output `Identity`、节点命名、
-Gemm 名称映射和 rank 审计。这些是 OMG/DOPT 工具链规范化，不是上述算子
-报错的数值语义替代。
+文件：`compatible.omg.onnx`。
 
-## 5. 多版 OMG ONNX 文件和完整算子数据
+1. **它是什么**：第一阶段 compatibility graph 经过量化/最终化后的 OMG 输入基线。
+2. **仍包含的关键中间算子**：`GatherND=36`、`ScatterND=154`。
+3. **为什么还需要继续改**：这些算子虽然不属于最初五类不支持算子，但在实际
+   OMG 转换中继续暴露兼容性和 shape inference 问题。
+4. **规模**：4,402 个节点、26 种 op type。
 
-所有已统计文件位于同一 `edge_policy_16actions_int8_dyn_s8_v2` 输出目录。
-`compatible.omg_v1.onnx` 当时不存在，日志记录为 `FileNotFoundError`，因此不能
-补写或推断其算子数。
+### 4.2 base -> v2：改写 36 个固定 `GatherND`
 
-| 文件 | 总节点 | 算子种类 | 相对上一可用版本的主要变化 | 对应处理 |
-| --- | ---: | ---: | --- | --- |
-| `compatible.omg.onnx` | 4,402 | 26 | 基线 | 第一阶段之后、第二阶段各类 ND 算子仍存在 |
-| `compatible.omg_v1.onnx` | 不可用 | 不可用 | 文件缺失 | 无可验证数据 |
-| `compatible.omg_v2.onnx` | 53,150 | 25 | 总计 `+48,748`；`GatherND -36`、`Slice +47,972`、`Concat +784`、`Reshape +28` | 36 个固定 full-coordinate `GatherND` 展开；增减严格守恒 |
-| `compatible.omg_v3.onnx` | 53,156 | 25 | 总计 `+6`；`ScatterND -2`、`Slice +4`、`Add +2`、`Concat +2` | 2 个连续 axis-0 `ScatterND(add)` 改为 Slice/Add/Concat |
-| `compatible.omg_v4.onnx` | 242,051 | 25 | 总计 `+188,895`；`ScatterND -124`、`Slice +185,938`、`Concat +3,081` | 124 个静态行 overwrite ScatterND 展开；仍剩 28 个；OMG 最终在 `node_mul_23` 的 124/128 广播推形失败 |
+文件变化：`compatible.omg.onnx -> compatible.omg_v2.onnx`。
 
-### 5.1 v4 的实际终止错误和因果边界
+#### 4.2.1 为什么改变
+
+base 仍有 36 个固定索引 `GatherND`。为避免 OMG 处理这些 full-coordinate
+GatherND 路径时的兼容问题，第二阶段将它们全部 lower 为基础 shape 算子。
+
+#### 4.2.2 怎么改变
+
+对每个 `GatherND(data, indices)`：
+
+1. 静态解析 `data_shape` 和 `indices`。
+2. 若 indices 是连续的 `[N,1]` axis-0 row indices，直接生成一个 `Slice`。
+3. 若 indices 是完整坐标 `[N,rank(data)]`：
+   - 用 `ravel_multi_index` 转成 row-major flat indices；
+   - 先 `Reshape(data, [-1])`；
+   - 把相邻 flat index 合并成连续区间；
+   - 每个区间生成一个 `Slice`；
+   - 用 fan-in 不超过 64 的分层 `Concat` 拼回 GatherND 输出；
+   - 这里新增的 `Reshape` 用于先把原 data 展平成一维，随后按 flat index 切片。
+4. 无法静态解析、越界或顺序不满足安全条件的节点必须报告 unresolved，不得
+   猜测改写。
+
+#### 4.2.3 改了哪些算子和数量
+
+```text
+GatherND  -36     36 -> 0
+Slice  +47,972   290 -> 48,262
+Concat    +784   143 -> 927
+Reshape    +28   340 -> 368
+总节点 +48,748  4,402 -> 53,150
+```
+
+数量严格守恒：`47,972 + 784 + 28 - 36 = 48,748`。
+
+#### 4.2.4 结果
+
+v2 已无 `GatherND`，但仍有 `ScatterND=154`。节点名可能继续保留
+`node_GatherND_*`，只是其 `op_type` 已变为 `Slice` 或替代子图；OMG 日志打印
+旧节点名不代表模型仍含 GatherND op。
+
+### 4.3 v2 -> v3：改写 2 个 `ScatterND(reduction=add)`
+
+文件变化：`compatible.omg_v2.onnx -> compatible.omg_v3.onnx`。
+
+#### 4.3.1 为什么改变
+
+第一阶段为了消除 `ScatterElements(axis=0,reduction=add)`，生成了中间形式
+`ScatterND(reduction=add)`。OMG 仍不接受带 add reduction 的 ScatterND，因此
+必须继续 lower。
+
+#### 4.3.2 适用数据条件
+
+只处理同时满足以下条件的节点：
+
+1. indices 是静态 `[N,1]`；
+2. indices 表示连续 axis-0 行；
+3. updates 的第 0 维是 `N`，其余维与 data 对应区域完全相同；
+4. 更新范围在 data axis-0 边界内。
+
+#### 4.3.3 怎么改变
+
+```text
+ScatterND(data, rows=[start:start+N], updates, reduction=add)
+  -> prefix  = Slice(data, [0:start])
+  -> current = Slice(data, [start:start+N])
+  -> updated = Add(current, updates)
+  -> suffix  = Slice(data, [start+N:end])
+  -> Concat(prefix, updated, suffix, axis=0)
+```
+
+空 prefix/suffix 按边界情况省略。不能证明上述条件的 reduction ScatterND 会让
+finalization 失败，不允许静默改变语义。
+
+#### 4.3.4 改了哪些算子和数量
+
+```text
+ScatterND  -2   154 -> 152
+Slice      +4   48,262 -> 48,266
+Add        +2   453 -> 455
+Concat     +2   927 -> 929
+总节点     +6   53,150 -> 53,156
+```
+
+数量严格守恒：`4 + 2 + 2 - 2 = 6`。这表明 2 个 add 型 ScatterND 各自生成
+2 个 Slice、1 个 Add、1 个 Concat。
+
+#### 4.3.5 结果
+
+v3 消除了全部 2 个 `ScatterND(reduction=add)`，但仍有 152 个 ScatterND；其中
+overwrite ScatterND 随后触发 OMG shape inference 问题。
+
+### 4.4 v3 -> v4：改写 124 个 overwrite `ScatterND`
+
+文件变化：`compatible.omg_v3.onnx -> compatible.omg_v4.onnx`。
+
+#### 4.4.1 为什么改变
+
+OMG 在 `node_ScatterND_239` 终止 IR 生成，报：
+
+```text
+indices.dim[0] = 20
+updates.dim[0] = 19
+Failed to generator IR graph
+```
+
+但精确 ONNX 数据是：
+
+```text
+data    [64,3201,1]
+indices [20,1] = [1,4,7,...,55,58]
+updates [20,3201,1]
+```
+
+updates 来自 `Slice(start=1,end=60,step=3,dim=64)`；按 ONNX exclusive-end/ceil
+语义结果应为 20 行。OMG 却在下游 ScatterND verifier 中推成 19 行。因此这里
+不是 ONNX ScatterND 自身 shape 非法，而是 OMG 对 strided Slice 的 shape inference
+与 ONNX 语义不一致，错误最终暴露在 ScatterND。
+
+#### 4.4.2 适用数据条件
+
+只处理同时满足以下条件的 default-overwrite ScatterND：
+
+1. reduction 缺省或为 `none`；显式 `reduction=none` attribute 先移除；
+2. indices 是静态 `[N,1]` axis-0 row indices；
+3. row indices 已排序、互不重复、全部在 data 边界内；
+4. updates shape 与 `N` 行 data slice 完全匹配。
+
+#### 4.4.3 怎么改变
+
+1. 按 row indices 把原 data 切成未更新区间。
+2. 从 updates 中为每个目标行生成对应的单行 `Slice`。
+3. 按原 axis-0 行顺序交替排列“原 data 区间”和“update 行”。
+4. 使用 fan-in 不超过 64 的分层 `Concat(axis=0)` 重建完整 tensor。
+5. 不能满足条件的 ScatterND 保留并写入 report，不强行改写。
+
+#### 4.4.4 改了哪些算子和数量
+
+```text
+ScatterND    -124   152 -> 28
+Slice    +185,938   48,266 -> 234,204
+Concat     +3,081   929 -> 4,010
+总节点   +188,895   53,156 -> 242,051
+```
+
+数量严格守恒：`185,938 + 3,081 - 124 = 188,895`。巨量 Slice/Concat 是逐行精确
+重建 overwrite 语义的直接代价，不是重复统计。
+
+#### 4.4.5 结果和 v4 新报错
+
+- v4 消除了 124 个满足条件的 overwrite ScatterND，还剩 28 个不满足该 row-wise
+  rewrite 条件的 ScatterND。
+- `node_ScatterND_239` 不再是终止点。
+- v4 继续执行后，在 `node_mul_23` 出现新的 124/128 feature 维广播错误，OMG
+  仍未成功生成 IR。
+
+### 4.5 v4 当前终止错误：`node_mul_23`
 
 v4 的 OMG 日志按执行顺序说明：
 
@@ -135,7 +379,11 @@ Slice inputs、源 tensor shape、starts/ends/axes/steps。若 ONNX 本身已是
 128，图在进入 OMG 前就存在真实 shape 不一致；若 ONNX 是 128 而 OMG 日志变成
 124，才可以归因于 OMG 推形或 constant folding。
 
-### 5.2 每版完整 op count
+## 5. base/v2/v3/v4 完整算子数量对比
+
+所有已统计文件位于同一 `edge_policy_16actions_int8_dyn_s8_v2` 输出目录。
+`compatible.omg_v1.onnx` 当时不存在并报 `FileNotFoundError`，所以本文不推断 v1
+数据。下表保留全部已出现的 op type，而不是只列发生变化的算子。
 
 | Op | base | v2 | v3 | v4 |
 | --- | ---: | ---: | ---: | ---: |
