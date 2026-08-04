@@ -167,6 +167,99 @@ def _element_type_map(graph) -> dict[str, int]:
     return element_types
 
 
+def _materialize_static_mul_broadcasts(graph, onnx) -> list[dict[str, object]]:
+    """Replace a single singleton-axis Mul broadcast with an explicit Expand.
+
+    OMG can lose the final feature width while constant-folding RoPE position
+    tensors.  Restrict this normalization to equal-rank, fully static operands
+    where exactly one axis expands from 1; those are the cases in which Expand
+    is exactly the ONNX Mul broadcast, without inventing or padding values.
+    """
+
+    import numpy as np
+
+    shapes = _shape_map(graph)
+    names = {
+        name
+        for node in graph.node
+        for name in [node.name, *node.input, *node.output]
+        if name
+    }
+    names.update(tensor.name for tensor in graph.initializer)
+
+    def unique(base: str) -> str:
+        candidate = base
+        suffix = 1
+        while candidate in names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        names.add(candidate)
+        return candidate
+
+    materialized: list[dict[str, object]] = []
+    for node in list(graph.node):
+        if node.op_type != "Mul" or len(node.input) != 2:
+            continue
+        left_shape = shapes.get(node.input[0])
+        right_shape = shapes.get(node.input[1])
+        if (
+            left_shape is None
+            or right_shape is None
+            or len(left_shape) < 2
+            or len(left_shape) != len(right_shape)
+            or left_shape == right_shape
+        ):
+            continue
+
+        for input_index, (source_shape, target_shape) in enumerate(
+            ((left_shape, right_shape), (right_shape, left_shape))
+        ):
+            expanded_axes = [
+                axis
+                for axis, (source_dim, target_dim) in enumerate(zip(source_shape, target_shape))
+                if source_dim == 1 and target_dim > 1
+            ]
+            if len(expanded_axes) != 1 or any(
+                source_dim != target_dim and axis not in expanded_axes
+                for axis, (source_dim, target_dim) in enumerate(zip(source_shape, target_shape))
+            ):
+                continue
+
+            original_input = node.input[input_index]
+            prefix = node.name or node.output[0] or "mul"
+            shape_name = unique(f"{prefix}_broadcast_shape")
+            expanded_name = unique(f"{original_input}_expanded_for_{prefix}")
+            expand_name = unique(f"{prefix}_materialize_broadcast")
+            graph.initializer.append(
+                onnx.numpy_helper.from_array(
+                    np.asarray(target_shape, dtype=np.int64), name=shape_name
+                )
+            )
+            graph.node.insert(
+                list(graph.node).index(node),
+                onnx.helper.make_node(
+                    "Expand",
+                    [original_input, shape_name],
+                    [expanded_name],
+                    name=expand_name,
+                ),
+            )
+            node.input[input_index] = expanded_name
+            materialized.append(
+                {
+                    "mul_name": node.name,
+                    "input_index": input_index,
+                    "source_tensor": original_input,
+                    "source_shape": list(source_shape),
+                    "target_shape": list(target_shape),
+                    "expanded_axis": expanded_axes[0],
+                    "expand_name": expand_name,
+                }
+            )
+            break
+    return materialized
+
+
 def _lower_fixed_gather_nd(graph, resolve, onnx) -> tuple[int, int, list[str]]:
     """Lower fixed GatherND to Slice or flattened Slice+Concat only."""
     import numpy as np
@@ -671,6 +764,7 @@ def main() -> None:
     normalized_reshape_allowzero, unresolved_reshape_allowzero = _normalize_safe_reshape_allowzero(
         model.graph, resolve
     )
+    materialized_mul_broadcasts = _materialize_static_mul_broadcasts(model.graph, onnx)
     lowered_contiguous_gather_nd, lowered_segmented_gather_nd, unresolved_gather_nd = (
         _lower_fixed_gather_nd(model.graph, resolve, onnx)
     )
@@ -751,6 +845,8 @@ def main() -> None:
         "eliminated_graph_output_identities": eliminated_graph_output_identities,
         "normalized_reshape_allowzero_count": normalized_reshape_allowzero,
         "unresolved_reshape_allowzero": unresolved_reshape_allowzero,
+        "materialized_mul_broadcast_count": len(materialized_mul_broadcasts),
+        "materialized_mul_broadcasts": materialized_mul_broadcasts,
         "lowered_contiguous_gather_nd_count": lowered_contiguous_gather_nd,
         "lowered_segmented_gather_nd_count": lowered_segmented_gather_nd,
         "unresolved_gather_nd": unresolved_gather_nd,

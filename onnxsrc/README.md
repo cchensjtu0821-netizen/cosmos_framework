@@ -41,7 +41,10 @@ sampler, CFG loop, or action postprocessing.
 6. `finalize_onnx.py` assigns every node a unique non-empty name, bypasses
    redundant `Identity` nodes immediately before graph outputs for OMG
    compatibility, normalizes safe nonzero `Reshape.allowzero` attributes, and
-   lowers fixed `GatherND` patterns to `Slice`/`Concat`. It removes explicit
+   materializes fully static single-axis singleton broadcasts before `Mul` as
+   explicit `Expand` nodes. This preserves ONNX broadcast semantics while
+   preventing OMG constant folding from losing the RoPE feature width. It also
+   lowers fixed `GatherND` patterns to `Slice`/`Concat` and removes explicit
    default `ScatterND(reduction=none)` attributes and lowers validated
    contiguous `ScatterND(reduction=add)` patterns to `Slice`/`Add`/`Concat`.
    It also lowers default-overwrite `ScatterND` with static, sorted, unique
