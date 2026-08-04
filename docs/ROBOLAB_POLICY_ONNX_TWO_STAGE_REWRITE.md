@@ -221,7 +221,62 @@ Reshape    +28   340 -> 368
 
 数量严格守恒：`47,972 + 784 + 28 - 36 = 48,748`。
 
-#### 4.2.4 结果
+#### 4.2.4 为什么会增加 47,972 个 Slice：从 causal mask shape 精确计算
+
+这里容易把 head dimension 和 attention score shape 混在一起。Edge hidden size
+是 2048，attention 布局是 16 heads、每个 head dimension 128：
+
+```text
+2048 = 16 heads * 128 head_dim
+```
+
+但 causal mask 不包含被 `Q @ K^T` 收缩掉的 head dimension。固定 prompt 段的
+sequence length 是 108，所以本批 full-coordinate GatherND 对应的 attention
+score/mask 广播 shape 是：
+
+```text
+[16, 108, 108] = [heads, query_length, key_length]
+```
+
+不是 `[16,128,128]`；这里的 128 是 Q/K/V 每个 head 的 feature width，不是
+causal mask 的 query/key length。
+
+对每个 causal `Where`，第一阶段生成未遮挡位置的完整坐标：
+
+```text
+scores shape  = [16,108,108]
+indices shape = [94,176,3]
+```
+
+其中每个 head 的下三角含对角线元素数为 `108*109/2=5,886`，16 个 heads 共
+`16*5,886=94,176` 个未遮挡 score scalar。base→v2 把完整三维坐标转换成
+row-major flat indices，再把相邻 flat index 合并为一个 Slice。
+
+对单个 head：每个 query row 的未遮挡 prefix 在 flat buffer 中是一段连续区间；
+相邻 query row 之间被 masked suffix 隔开。跨 head 边界时，前一个 head 的最后一行
+是完整的 108 个元素，并与下一个 head 第一行的第一个未遮挡元素相邻，因此两段
+会合并。最终每个 `[16,108,108]` causal GatherND 的连续区间数是：
+
+```text
+16*108 - (16-1) = 16*(108-1)+1 = 1,713
+```
+
+现有 op delta 可精确对应到这一 shape：
+
+1. `Reshape +28`：36 个 GatherND 中有 28 个走 full-coordinate causal 路径；
+2. 这 28 个节点各产生 1,713 个区间 Slice：
+   `28*1,713=47,964`；
+3. 其余 8 个 GatherND 是连续 `[N,1]` row indices，各原地改成 1 个 Slice：
+   `47,964+8=47,972`；
+4. 每个 1,713-piece 子图按 fan-in 64 分层，第一层需要
+   `ceil(1,713/64)=27` 个 Concat，再加 1 个 `concat_final`，即每个节点 28 个；
+   `28*28=784`，与 `Concat +784` 完全一致。
+
+因此 base→v2 的节点爆炸不是 36 个 GatherND 平均、随机地产生大量 Slice，而是
+28 个固定 `[16,108,108]` causal score GatherND 各自被确定性展开成 1,713 个
+Slice；另外 8 个 GatherND 只各贡献 1 个 Slice。
+
+#### 4.2.5 结果
 
 v2 已无 `GatherND`，但仍有 `ScatterND=154`。节点名可能继续保留
 `node_GatherND_*`，只是其 `op_type` 已变为 `Slice` 或替代子图；OMG 日志打印
@@ -334,7 +389,86 @@ Concat     +3,081   929 -> 4,010
 数量严格守恒：`185,938 + 3,081 - 124 = 188,895`。巨量 Slice/Concat 是逐行精确
 重建 overwrite 语义的直接代价，不是重复统计。
 
-#### 4.4.5 结果和 v4 新报错
+#### 4.4.5 为什么会增加 185,938 个 Slice：从 shape 计算
+
+对任意一个满足改写条件的节点，记：
+
+```text
+data shape    = [M, d1, d2, ...]
+indices shape = [N, 1]
+updates shape = [N, d1, d2, ...]
+```
+
+改写只沿 axis 0 切片。后面的 `[d1,d2,...]` 每次整体保留，因此它们影响每个
+Slice 搬运的数据量，但不直接决定 Slice 节点个数。节点个数由下面两部分决定：
+
+1. **update Slice：固定为 `N` 个。** 每个 update row 都执行一次
+   `Slice(updates, [j:j+1], axis=0)`，输出 shape 是 `[1,d1,d2,...]`。
+2. **data Slice：固定为 `G` 个。** `G` 是未更新 row 在 axis 0 上形成的非空连续
+   区间数。连续未更新行合并成一个 Slice，不为零长度区间创建 Slice。
+
+因此单个 ScatterND 的精确公式是：
+
+```text
+Slice_count = N + G
+0 <= G <= N + 1
+N <= Slice_count <= 2N + 1
+```
+
+- 如果更新的是一整段连续行，未更新 data 最多只有 prefix 和 suffix，`G` 很小，
+  Slice 数接近 `N`。
+- 如果更新行很稀疏、相邻 update row 之间都有未更新行，则每两个 update 之间都要
+  保留一个 data Slice，`G` 接近 `N+1`，Slice 数接近 `2N+1`。
+
+`node_ScatterND_239` 是可完整计算的实例：
+
+```text
+data    = [64, 3201, 1]       M = 64
+indices = [20, 1]             N = 20
+rows    = [1,4,7,...,55,58]   相邻更新行间隔 3
+updates = [20, 3201, 1]
+```
+
+它的替代图包含：
+
+1. 20 个 update Slice，每个输出 `[1,3201,1]`；
+2. 21 个 data Slice：`[0:1]`、19 个两行的中间区间，以及 `[59:64]`；
+3. 总计 `20+21=41` 个 Slice；
+4. 41 个 piece 不超过 fan-in 64，所以再用 1 个 `Concat(axis=0)` 恢复
+   `[64,3201,1]`。
+
+这里一个 ScatterND 就变成了 41 个 Slice 和 1 个 Concat。其余被处理节点中的
+`N` 可以远大于 20，所以 124 个 ScatterND 最终产生 185,938 个 Slice。
+
+目前保存的汇总数据没有逐节点记录每个 `N` 和 `G`，因此不能从总数唯一还原每个
+节点的 indices shape；但可以给出严格的总体边界。设 124 个节点的更新行总数为
+`N_total`，由 `Slice_total=185,938` 和每节点 `G<=N+1` 可得：
+
+```text
+92,907 <= N_total <= 185,938
+平均每个被改写 ScatterND：
+749.25 <= N <= 1,499.5
+平均每个节点实际生成 Slice = 185,938 / 124 = 1,499.5
+```
+
+这个范围不是对单个节点 shape 的猜测，而是由当前 pass 的构图规则推导出的边界。
+若要列出 124 个节点各自的精确 `data/indices/updates shape`、`N`、`G` 和 Slice
+数量，需要读取生成 v4 时的精确 ONNX，或让 finalize report 额外记录每个已 lower
+节点的这些字段。
+
+#### 4.4.6 为什么还增加 3,081 个 Concat
+
+每个 ScatterND 的 `N+G` 个 Slice 输出必须按原 axis-0 顺序拼回完整 data shape。
+为了避免单个 Concat 输入过多，代码把 fan-in 限制为 64：
+
+1. 每 64 个 piece 先生成一个中间 Concat；
+2. 如果中间结果仍超过 64 个，继续分层合并；
+3. 最后生成一个 `concat_final`。
+
+所以 v3→v4 不仅增加 185,938 个叶子 Slice，还增加 3,081 个分层 Concat。它们
+共同实现原 overwrite ScatterND，不是额外的模型计算语义。
+
+#### 4.4.7 结果和 v4 新报错
 
 - v4 消除了 124 个满足条件的 overwrite ScatterND，还剩 28 个不满足该 row-wise
   rewrite 条件的 ScatterND。
