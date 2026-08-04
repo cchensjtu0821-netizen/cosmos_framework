@@ -65,6 +65,7 @@ COSMOS3_FAKEQUANT_WEIGHT="${COSMOS3_QUANT_ROOT}/fakequant_weight.pth"
 COSMOS3_QUANT_OUTPUT_DIR="${COSMOS3_QUANT_ROOT}/quant_params"
 COSMOS3_QUANT_PARAMS_FILE="${COSMOS3_QUANT_PARAMS_FILE:-${COSMOS3_QUANT_OUTPUT_DIR}_v2}"
 COSMOS3_ONNX_RAW="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.onnx"
+COSMOS3_ONNX_WEIGHT="${COSMOS3_ONNX_WEIGHT:-${COSMOS3_ONNX_RAW}.data}"
 COSMOS3_ONNX_COMPATIBLE="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.onnx"
 COSMOS3_ONNX_FINAL="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.named.onnx"
 COSMOS3_REWRITE_REPORT="${COSMOS3_ONNX_COMPATIBLE}.rewrite.json"
@@ -166,12 +167,17 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         echo "OMG executable not found or not executable: ${COSMOS3_OMG_BIN}" >&2
         exit 1
     fi
+    if [[ ! -f "${COSMOS3_ONNX_WEIGHT}" ]]; then
+        echo "ONNX external weight file not found: ${COSMOS3_ONNX_WEIGHT}" >&2
+        exit 1
+    fi
     "${COSMOS3_OMG_BIN}" \
         --model="${COSMOS3_ONNX_FINAL}" \
         --framework=5 \
         --output="${COSMOS3_OMC_OUTPUT}" \
         --compress_conf="${COSMOS3_QUANT_PARAMS_FILE}" \
         --target=omc \
+        --weight="${COSMOS3_ONNX_WEIGHT}" \
         --input_shape="${COSMOS3_OMG_INPUT_SHAPE}" \
         --input_type="video_latent:FP16;action_latent:FP16;vision_timestep:FP16;action_timestep:FP16;prompt_embeddings:FP16" \
         --output_type="vision_velocity:FP16;action_velocity:FP16" \
@@ -192,7 +198,7 @@ echo "DOPT config: ${COSMOS3_QUANT_CONFIG}"
 echo "fake-quant weight: ${COSMOS3_FAKEQUANT_WEIGHT}"
 echo "quant params: ${COSMOS3_QUANT_PARAMS_FILE}"
 echo "final ONNX: ${COSMOS3_ONNX_FINAL}"
-echo "ONNX external data: ${COSMOS3_ONNX_RAW}.data"
+echo "ONNX external data: ${COSMOS3_ONNX_WEIGHT}"
 echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
 echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"
