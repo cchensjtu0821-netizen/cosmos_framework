@@ -77,7 +77,7 @@ OMG 自身的 shape inference/算子实现限制。
 | 固定 `GatherND` | 为避免 OMG 对这些固定索引路径的兼容问题而继续 lower；base 中有 36 个 | base: `GatherND=36`；v2: `GatherND=0` | 连续索引直接改 `Slice`；一般固定 full-coordinate 索引先 flatten，再按连续段生成 `Slice`，用 bounded-fan-in `Concat` 合并，必要时 `Reshape` | 已完成结构改写；仍需每版 OMG/数值验证 |
 | `ScatterND(reduction=add)` | OMG 不接受由第一阶段 `ScatterElements` lowering 产生的 add reduction | 共 2 个；静态 `[N,1]` 连续 axis-0 行索引，updates shape 匹配 | `Slice(data) -> Add(updates) -> Concat(prefix, updated, suffix)`；未满足条件的 reduction 必须令 finalization 失败 | v3 已消除这 2 个 |
 | overwrite `ScatterND` | `node_ScatterND_239` 报 `indices.dim[0]=20`、`updates.dim[0]=19` 并终止 IR 生成 | ONNX 实际为 data `[64,3201,1]`、indices `[20,1]`、updates `[20,3201,1]`；indices=`[1,4,7,...,55,58]`。上游 Slice 是 `start=1,end=60,step=3,dim=64`，按 ONNX 语义应有 20 行 | 对静态、排序、唯一、边界内的 `[N,1]` 行索引，保留 data 未更新区间并插入 updates 的单行 `Slice`，最后用 fan-in<=64 的分层 `Concat`；显式 `reduction=none` 属性先移除 | 诊断为 OMG strided-Slice shape inference 偏差；v4 消除 124 个，仍留 28 个非适配 layout |
-| `Mul` 广播 | overwrite ScatterND 问题绕过后，OMG 在 `node_mul_23` 报 124 与 128 无法广播 | 日志出现 `[3093,1,128] * [3093,16,128]` 的候选静态广播；另有四个 GatherND folding 路径出现宽度 `124`；`3093=3201-108` | 仅当两输入 fully-static、同 rank、且恰有一个 axis 从 1 广播到目标值时，显式插入 `Expand -> Mul`。若实际是 124 对 128，不补零、不伪造数值，保持未处理并继续诊断 | `INVESTIGATING`；已实现安全 normalization，但现有 v1-v4 均仍为 `Expand=118`，不能声称包含此改写 |
+| `Mul` 广播 | overwrite ScatterND 问题绕过后，v4 的 OMG 在 `node_mul_23` 报 124 与 128 无法广播 | 四条已 lower 的 GatherND 路径均被 OMG constant-fold 为 feature width `124` 的 Slice；`node_mul_23` 另一输入要求 `128`；`scaleShape[0]=3093=3201-108` 是 sequence 后半段长度 | 仅当两输入 fully-static、同 rank、且恰有一个 axis 从 1 广播到目标值时，显式插入 `Expand -> Mul`。若实际是 124 对 128，不补零、不伪造数值，保持未处理并继续诊断 | `INVESTIGATING`；这是 v4 的终止错误。现有 v1-v4 均为 `Expand=118`，不能声称已包含或解决此改写 |
 | external weight 参数 | OMG 命令未传分离的 ONNX external data | 权重默认 `${COSMOS3_ONNX_RAW}.data` | 脚本检查文件存在并传 `--weight` | `RESOLVED`；这是调用参数，不是算子改写 |
 
 此外，最终化阶段还会处理 `Reshape.allowzero`、graph-output `Identity`、节点命名、
@@ -96,9 +96,46 @@ Gemm 名称映射和 rank 审计。这些是 OMG/DOPT 工具链规范化，不�
 | `compatible.omg_v1.onnx` | 不可用 | 不可用 | 文件缺失 | 无可验证数据 |
 | `compatible.omg_v2.onnx` | 53,150 | 25 | 总计 `+48,748`；`GatherND -36`、`Slice +47,972`、`Concat +784`、`Reshape +28` | 36 个固定 full-coordinate `GatherND` 展开；增减严格守恒 |
 | `compatible.omg_v3.onnx` | 53,156 | 25 | 总计 `+6`；`ScatterND -2`、`Slice +4`、`Add +2`、`Concat +2` | 2 个连续 axis-0 `ScatterND(add)` 改为 Slice/Add/Concat |
-| `compatible.omg_v4.onnx` | 242,051 | 25 | 总计 `+188,895`；`ScatterND -124`、`Slice +185,938`、`Concat +3,081` | 124 个静态行 overwrite ScatterND 展开；仍剩 28 个 |
+| `compatible.omg_v4.onnx` | 242,051 | 25 | 总计 `+188,895`；`ScatterND -124`、`Slice +185,938`、`Concat +3,081` | 124 个静态行 overwrite ScatterND 展开；仍剩 28 个；OMG 最终在 `node_mul_23` 的 124/128 广播推形失败 |
 
-### 5.1 每版完整 op count
+### 5.1 v4 的实际终止错误和因果边界
+
+v4 的 OMG 日志按执行顺序说明：
+
+1. 多个由 overwrite ScatterND 生成的 `ConcatD` 已完成 constant folding。日志中的
+   `inputConcatAxis ...` 和一次 `0 dim concatted` 是 kernel 过程信息；对应节点随后
+   出现 `[const_folding_success]`，因此它们不是本次 OMG 退出点。
+2. 名为 `node_GatherND_288`、`295`、`306`、`313` 的节点也出现
+   `[const_folding_success]`，实际 IR op 已是 `StridedSliceV2`。v4 的 ONNX op count
+   为 `GatherND=0` 并不矛盾：finalizer 改了 `op_type`，但保留原节点名，OMG 日志
+   打印的是这个历史名称。
+3. 四条 Slice 分别覆盖 sequence 的 `0:108` 或 `108:3201`，同时都读取 feature
+   维 `0:124`，OMG 看到的该维实际大小也是 124。随后的 `ExpandDims`、`Cos/Sin`
+   和 `Squeeze` constant folding 均成功。
+4. 真正的 fatal chain 是
+   `DynamicQuantMaxInfer(scaleShape[0]=3093)` ->
+   `node_mul_23: dim[2] 124 should be 128` ->
+   `MathBroadCastInfer failed` -> `Failed to generator IR graph`。
+
+因此，**v4 失败的直接原因**已经确定：OMG IR shape inference 时，
+`node_mul_23` 的两个输入在 feature 维分别为 124 和 128，无法按 ONNX 广播规则
+相乘。`3093` 对应 `3201-108`，解释的是 sequence 维，不是 124/128 feature
+差异的成因。
+
+**更上游的根因尚未由这段日志确定。** 当前证据只证明 124 宽张量来自 RoPE
+相关的 Slice/Cos/Sin 路径；还不能判断：
+
+- v4 ONNX 中该 Slice 的源张量本来就是 124 宽；
+- 量化参数或前序 shape metadata 把应为 128 的维度记录成 124；
+- 或 OMG constant folding/IR shape inference 把 ONNX 中的 128 错推成 124。
+
+要区分这三种情况，必须在服务器直接读取 v4 ONNX，打印 `node_mul_23` 两个输入
+及其 producer chain，并打印四个历史 `node_GatherND_*` 节点当前的 `op_type`、
+Slice inputs、源 tensor shape、starts/ends/axes/steps。若 ONNX 本身已是 124 对
+128，图在进入 OMG 前就存在真实 shape 不一致；若 ONNX 是 128 而 OMG 日志变成
+124，才可以归因于 OMG 推形或 constant folding。
+
+### 5.2 每版完整 op count
 
 | Op | base | v2 | v3 | v4 |
 | --- | ---: | ---: | ---: | ---: |
@@ -155,8 +192,10 @@ ScatterND 更少不等于更适合部署；必须以 OMG 是否成功、转换�
 - 第二阶段的 v2/v3/v4 节点变化均能由具体 pass 精确解释；v1 没有文件，不能补数据。
 - v4 仍有 28 个 `ScatterND`，它们不是静态 `[N,1]` 行 overwrite pattern，不能
   为追求计数为 0 而强行套用现有 rewrite。
-- `node_mul_23` 的真实 124/128 来源仍在调查。只有 singleton-axis 广播可以安全
-  显式化；真实宽度不一致不能通过 padding 或 blanket `Expand` 修补。
+- v4 已确认因 `node_mul_23` 的 124/128 feature 维无法广播而失败；124 是来自
+  RoPE Slice 源数据、量化/shape metadata，还是 OMG 推形错误，仍需检查精确 v4
+  ONNX 才能定论。只有 singleton-axis 广播可以安全显式化；真实宽度不一致不能
+  通过 padding 或 blanket `Expand` 修补。
 - 本地工作区没有用户服务器上的 ONNX/CUDA/OMG/OMC 运行环境，因此本文整理的是
   已记录的服务器证据和代码语义，不声称本地完成了 OMG/OMC 或数值验证。
 
