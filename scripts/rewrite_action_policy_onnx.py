@@ -1035,6 +1035,23 @@ def _verify_rewrite_equivalence(
             f"available={sorted(available)}"
         )
 
+    cuda_library_preload = None
+    if "CUDAExecutionProvider" in requested:
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if preload_dlls is not None:
+            preload_dlls(directory="")
+            cuda_library_preload = "onnxruntime.preload_dlls(directory='')"
+        else:
+            try:
+                import torch  # noqa: F401
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "CUDA equivalence verification requires discoverable CUDA/cuDNN "
+                    "libraries. Install PyTorch or use ONNX Runtime >= 1.21 with "
+                    "preload_dlls support."
+                ) from exc
+            cuda_library_preload = "import torch"
+
     original_session = ort.InferenceSession(str(reference_path), providers=requested)
     rewritten_session = ort.InferenceSession(str(output_path), providers=requested)
     original_inputs = _make_verification_inputs(
@@ -1120,6 +1137,7 @@ def _verify_rewrite_equivalence(
     result = {
         "enabled": True,
         "providers": requested,
+        "cuda_library_preload": cuda_library_preload,
         "seed": seed,
         "atol": atol,
         "rtol": rtol,
