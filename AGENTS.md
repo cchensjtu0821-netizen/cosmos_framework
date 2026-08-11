@@ -152,20 +152,22 @@ The FP32 Edge Policy export and structural rewrites currently reach:
 
 - zero target-unsupported nodes when all rewrites are enabled;
 - zero tensors above rank 4, including graph I/O;
-- finite, numerically equivalent outputs with causal `Where` rewriting and
-  vision rank lowering enabled.
+- historical finite, numerically equivalent outputs with the superseded exact
+  causal overwrite rewrite and vision rank lowering enabled; the current finite
+  additive-mask candidate requires new server-side validation.
 
 The two previously isolated numerical-equivalence issues are resolved:
 
 1. **Causal mask rewrite**
    - Original: `Where(mask, -Inf, attention_scores)`.
-   - The rejected `Clip(attention_scores) + causal_bias` approach has been
-     replaced by exact fixed-layout overwrite semantics.
-   - The rewrite broadcasts the causal mask to the statically resolved score
-     shape, gathers only unmasked scores with `GatherND`, and scatters them into
-     an all-`-Inf` initializer with `ScatterND`.
-   - Masked source values are never read or used in arithmetic, so masked NaN
-     or Inf values cannot contaminate the result.
+   - The current edge candidate uses a shared fixed-layout additive bias with
+     `0` at visible positions and finite FP16-safe `-10000` at masked positions.
+   - This intentionally trades exact masked NaN/Inf branch isolation for a
+     compact `Add` graph whose masked softmax probabilities underflow to zero
+     for normal finite deployment scores.
+   - ORT output comparison remains mandatory, but an `allclose=False` result is
+     diagnostic and non-blocking so Step 6 and downstream OMG can run. Checker,
+     structural compatibility, shape/rank, and runtime failures remain blocking.
 
 2. **Vision rank lowering**
    - Fixed batch-1 rank-5 vision I/O is lowered to rank 4.

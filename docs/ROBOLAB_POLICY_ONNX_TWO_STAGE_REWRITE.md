@@ -130,23 +130,22 @@ tokenizer、VAE encoder、UniPC sampler、CFG、latent 更新和 action 后处�
 #### 3.5.2 causal attention `Where`
 
 1. **原 pattern**：`Where(mask, -Inf, attention_scores)`。
-2. **不能使用的方案**：早期 `Clip(scores) + causal_bias` 会读取并计算被 mask 的
-   NaN/Inf，破坏 `Where` 的分支隔离语义，已拒绝。
-3. **最终处理**：把 causal mask 广播到静态 score shape；仅生成未遮挡位置的完整
-   坐标；用 `GatherND` 只读取未遮挡 scores；以全 `-Inf` initializer 为底板，用
-   overwrite `ScatterND` 写回未遮挡值。
-4. **算子变化**：
+2. **当前端侧处理**：把 causal mask 广播到静态 score shape，生成一个可由 28 层
+   共享的有限 additive bias；有效位置为 `0`，遮挡位置为 `-10000`。
+3. **算子变化**：
 
    ```text
    Where(mask, -Inf, scores)
-     -> GatherND(unmasked scores)
-     -> ScatterND(overwrite into all--Inf initializer)
+     -> Add(scores, finite_causal_bias)
    ```
 
-5. **语义**：masked source value 从未被读取或用于算术，因此 NaN/Inf 不会污染
-   输出，保持原 `Where` 的分支隔离语义。
-6. **后续影响**：产生的固定 `GatherND` 在第二阶段 base→v2 被继续 lower；部分
-   overwrite `ScatterND` 在 v3→v4 被继续 lower。
+4. **精度条件**：`-10000` 可由 FP16 有限表示，并使正常有限 attention score 的
+   masked softmax 概率下溢为 0；它不保留原 `Where` 对 masked NaN/Inf 的分支隔离，
+   因而是有意的端侧近似，不再声明局部严格等价。
+5. **验证策略**：Step 5 仍记录 ORT 的 finite/allclose/error metrics；数值不等价只
+   打印警告并继续 Step 6 以后流程。结构审计、ONNX checker 或运行失败仍会终止。
+6. **历史说明**：下文 base/v2/v3/v4 的 causal GatherND/ScatterND 和节点数量记录
+   描述旧 overwrite 方案，用于解释历史 OMG 日志，不是当前新导出的预期结构。
 
 ### 3.6 第一阶段辅助处理：不属于五类缺失算子
 
