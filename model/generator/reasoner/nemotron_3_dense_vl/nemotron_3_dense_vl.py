@@ -109,12 +109,36 @@ class MultiModalRotaryEmbedding(nn.Module):
         return inv_freq, attention_factor
 
     def apply_interleaved_mrope(self, freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
-        freqs_t = freqs[0]
-        for dim, offset in enumerate((1, 2), start=1):
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
+        """Interleave temporal, height, and width frequencies without indexed writes.
+
+        Nemotron's active ``[24, 20, 20]`` layout is twenty ``[T, H, W]``
+        triplets followed by four temporal frequency slots. Building that layout
+        functionally avoids exporting the two strided slice assignments as
+        overwrite ``ScatterND`` nodes.
+        """
+        height_section, width_section = mrope_section[1:]
+        frequency_dim = sum(mrope_section)
+        if height_section != width_section or height_section * 3 > frequency_dim:
+            # Preserve the original layout for uncommon asymmetric sections.
+            # This branch is larger when exported, but remains functional and
+            # therefore still avoids ScatterND.
+            channels = []
+            for index in range(frequency_dim):
+                source = 0
+                if index % 3 == 1 and index < height_section * 3:
+                    source = 1
+                elif index % 3 == 2 and index < width_section * 3:
+                    source = 2
+                channels.append(freqs[source, ..., index : index + 1])
+            return torch.cat(channels, dim=-1)
+
+        interleaved_length = height_section * 3
+        temporal = freqs[0, ..., 0:interleaved_length:3]
+        height = freqs[1, ..., 1:interleaved_length:3]
+        width = freqs[2, ..., 2:interleaved_length:3]
+        interleaved = torch.stack((temporal, height, width), dim=-1).flatten(-2)
+        temporal_tail = freqs[0, ..., interleaved_length:]
+        return torch.cat((interleaved, temporal_tail), dim=-1)
 
     @torch.no_grad()
     @dynamic_rope_update
