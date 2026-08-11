@@ -114,7 +114,8 @@ class MultiModalRotaryEmbedding(nn.Module):
         Nemotron's active ``[24, 20, 20]`` layout is twenty ``[T, H, W]``
         triplets followed by four temporal frequency slots. Building that layout
         functionally avoids exporting the two strided slice assignments as
-        overwrite ``ScatterND`` nodes.
+        overwrite ``ScatterND`` nodes. Keep the interleave path rank 3 so ONNX
+        does not lower ``stack`` to the rank-4 Concat that crashes OMG.
         """
         height_section, width_section = mrope_section[1:]
         frequency_dim = sum(mrope_section)
@@ -136,7 +137,13 @@ class MultiModalRotaryEmbedding(nn.Module):
         temporal = freqs[0, ..., 0:interleaved_length:3]
         height = freqs[1, ..., 1:interleaved_length:3]
         width = freqs[2, ..., 2:interleaved_length:3]
-        interleaved = torch.stack((temporal, height, width), dim=-1).flatten(-2)
+        leading_shape = temporal.shape[:-1]
+        grouped = torch.cat((temporal, height, width), dim=-1)
+        interleaved = (
+            grouped.reshape(-1, 3, height_section)
+            .transpose(1, 2)
+            .reshape(*leading_shape, interleaved_length)
+        )
         temporal_tail = freqs[0, ..., interleaved_length:]
         return torch.cat((interleaved, temporal_tail), dim=-1)
 

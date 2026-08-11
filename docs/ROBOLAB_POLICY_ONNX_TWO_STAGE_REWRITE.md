@@ -459,11 +459,13 @@ updates = [20, 3201, 1]
 上述 `[1,4,7,...,58]` pattern 已定位到 Nemotron MRoPE 的高度频率写入；同一
 函数中的宽度写入使用 `[2,5,8,...,59]`。原 PyTorch 实现先取 temporal 频率，
 再用两个 stride-3 原地切片赋值覆盖 height/width，ONNX functionalization 因此
-生成两个 overwrite `ScatterND`。源码现改为函数式组合：分别 Slice 出 T/H/W
-频率槽，`Stack + Flatten` 恢复二十组 `[T,H,W]`，最后 Concat 四个 temporal
-tail 槽。活动 `[24,20,20]` 配置的通道顺序和数值不变，但新导出不再需要这两个
-MRoPE `ScatterND`。这个变化只会进入重新执行 Step 4 产生的 raw ONNX；复用旧
-raw ONNX 从 Step 5 开始不能验证或获得该变化。
+生成两个 overwrite `ScatterND`。第一版函数式组合用 `Stack + Flatten` 恢复
+二十组 `[T,H,W]`，虽然消除了 ScatterND，但 ONNX 把 Stack 导成三个 Unsqueeze
+和 rank-4 `Concat(axis=3)`，OMG 在该 Concat 的常量折叠中发生 allocator
+corruption。当前实现改为 rank-3 `Concat(T-block,H-block,W-block) -> Reshape ->
+Transpose -> Reshape`，再 Concat 四个 temporal tail 槽；通道顺序仍严格等于
+二十组 `[T,H,W]` 加四个 T。这个变化只会进入重新执行 Step 4 产生的 raw ONNX；
+复用旧 raw ONNX 从 Step 5 开始不能验证或获得该变化。
 
 目前保存的汇总数据没有逐节点记录每个 `N` 和 `G`，因此不能从总数唯一还原每个
 节点的 indices shape；但可以给出严格的总体边界。设 124 个节点的更新行总数为
