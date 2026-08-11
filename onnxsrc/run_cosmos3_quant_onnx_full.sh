@@ -16,7 +16,7 @@ COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-0}"  # 默认只生成
 COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个 .onnx.data
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
 COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转换 OMC
-COSMOS3_ONLY_STEP5="${COSMOS3_ONLY_STEP5:-0}"  # 仅复用现有 raw ONNX 执行兼容改写和数值验证
+COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用 raw ONNX，从 Step 5 继续到底
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
@@ -24,16 +24,16 @@ if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
     echo "Cosmos3 repository directory not found: ${COSMOS3_REPO_DIR}" >&2
     exit 1
 fi
-if [[ "${COSMOS3_ONLY_STEP5}" != "1" && ! -e "${COSMOS3_CHECKPOINT_PATH}" ]]; then
+if [[ "${COSMOS3_START_STEP5}" != "1" && ! -e "${COSMOS3_CHECKPOINT_PATH}" ]]; then
     echo "Cosmos3 checkpoint not found: ${COSMOS3_CHECKPOINT_PATH}" >&2
     echo "Edit COSMOS3_CHECKPOINT_PATH in this script." >&2
     exit 1
 fi
-if [[ "${COSMOS3_ONLY_STEP5}" != "1" && ! -d "${COSMOS3_DOPT_SIM_PATH}" ]]; then
+if [[ "${COSMOS3_START_STEP5}" != "1" && ! -d "${COSMOS3_DOPT_SIM_PATH}" ]]; then
     echo "DOPT simulator directory not found: ${COSMOS3_DOPT_SIM_PATH}" >&2
     exit 1
 fi
-if [[ "${COSMOS3_ONLY_STEP5}" != "1" && ! -f "${COSMOS3_LAYOUT_MANIFEST}" ]]; then
+if [[ "${COSMOS3_START_STEP5}" != "1" && ! -f "${COSMOS3_LAYOUT_MANIFEST}" ]]; then
     echo "FP32 ONNX layout manifest not found: ${COSMOS3_LAYOUT_MANIFEST}" >&2
     echo "Edit COSMOS3_LAYOUT_MANIFEST in this script." >&2
     exit 1
@@ -52,7 +52,7 @@ COSMOS3_QUANT_BIT=8
 COSMOS3_RESULT_ROOT="${COSMOS3_RESULT_ROOT:-/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/quant}"
 COSMOS3_QUANT_ROOT="${COSMOS3_QUANT_ROOT:-${COSMOS3_RESULT_ROOT}/edge_policy_${COSMOS3_ACTION_CHUNK_SIZE}actions_int8_dyn_s8}"
 
-if [[ "${COSMOS3_CLEAN_OUTPUT}" == "1" && "${COSMOS3_ONLY_STEP5}" != "1" ]]; then
+if [[ "${COSMOS3_CLEAN_OUTPUT}" == "1" && "${COSMOS3_START_STEP5}" != "1" ]]; then
     case "${COSMOS3_QUANT_ROOT}" in
         "${COSMOS3_RESULT_ROOT}"/*) rm -rf -- "${COSMOS3_QUANT_ROOT}" ;;
         *) echo "Refusing to clean path outside COSMOS3_RESULT_ROOT: ${COSMOS3_QUANT_ROOT}" >&2; exit 2 ;;
@@ -96,7 +96,7 @@ COMMON_ARGS=(
 
 cd "${COSMOS3_REPO_DIR}"
 
-if [[ "${COSMOS3_ONLY_STEP5}" != "1" ]]; then
+if [[ "${COSMOS3_START_STEP5}" != "1" ]]; then
     echo "========== Step 1: generate DOPT config =========="
     python3 "${COSMOS3_ONNX_SRC_DIR}/cosmos3_quantize.py" \
         --stage gen-config \
@@ -142,14 +142,6 @@ then
         "${COSMOS3_REWRITE_REPORT}" \
         "${COSMOS3_PROMPT_EMBEDDING}"
     exit 1
-fi
-
-if [[ "${COSMOS3_ONLY_STEP5}" == "1" ]]; then
-    echo "========== Step 5 validation complete =========="
-    echo "compatible ONNX: ${COSMOS3_ONNX_COMPATIBLE}"
-    echo "rewrite report: ${COSMOS3_REWRITE_REPORT}"
-    echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
-    exit 0
 fi
 
 echo "========== Step 6: normalize names and reject tensor ranks above 4 =========="
