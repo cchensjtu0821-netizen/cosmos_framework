@@ -17,6 +17,7 @@ COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为�
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
 COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转换 OMC
 COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用 raw ONNX，从 Step 5 继续到底
+COSMOS3_MATERIALIZE_MUL_BROADCASTS="${COSMOS3_MATERIALIZE_MUL_BROADCASTS:-0}"  # 默认保留历史隐式 Mul 广播
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
@@ -145,11 +146,16 @@ then
 fi
 
 echo "========== Step 6: normalize names and reject tensor ranks above 4 =========="
-python3 "${COSMOS3_ONNX_SRC_DIR}/finalize_onnx.py" \
-    --input "${COSMOS3_ONNX_COMPATIBLE}" \
-    --output "${COSMOS3_ONNX_FINAL}" \
-    --max-rank 4 \
+FINALIZE_ARGS=(
+    --input "${COSMOS3_ONNX_COMPATIBLE}"
+    --output "${COSMOS3_ONNX_FINAL}"
+    --max-rank 4
     --report-path "${COSMOS3_FINALIZE_REPORT}"
+)
+if [[ "${COSMOS3_MATERIALIZE_MUL_BROADCASTS}" == "1" ]]; then
+    FINALIZE_ARGS+=(--materialize-static-mul-broadcasts)
+fi
+python3 "${COSMOS3_ONNX_SRC_DIR}/finalize_onnx.py" "${FINALIZE_ARGS[@]}"
 
 echo "========== Step 7: compare quant-file entries with ONNX nodes =========="
 if [[ ! -f "${COSMOS3_QUANT_PARAMS_FILE}" ]]; then

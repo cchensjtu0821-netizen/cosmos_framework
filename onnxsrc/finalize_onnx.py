@@ -750,6 +750,14 @@ def main() -> None:
         default=4,
         help="Fail when a node input/output or graph I/O tensor exceeds this rank.",
     )
+    parser.add_argument(
+        "--materialize-static-mul-broadcasts",
+        action="store_true",
+        help=(
+            "Insert explicit Expand nodes for eligible static Mul broadcasts. "
+            "Disabled by default to preserve the historical implicit-broadcast graph."
+        ),
+    )
     args = parser.parse_args()
     if args.max_rank < 0:
         parser.error("--max-rank must be non-negative")
@@ -764,7 +772,11 @@ def main() -> None:
     normalized_reshape_allowzero, unresolved_reshape_allowzero = _normalize_safe_reshape_allowzero(
         model.graph, resolve
     )
-    materialized_mul_broadcasts = _materialize_static_mul_broadcasts(model.graph, onnx)
+    materialized_mul_broadcasts = (
+        _materialize_static_mul_broadcasts(model.graph, onnx)
+        if args.materialize_static_mul_broadcasts
+        else []
+    )
     lowered_contiguous_gather_nd, lowered_segmented_gather_nd, unresolved_gather_nd = (
         _lower_fixed_gather_nd(model.graph, resolve, onnx)
     )
@@ -845,6 +857,7 @@ def main() -> None:
         "eliminated_graph_output_identities": eliminated_graph_output_identities,
         "normalized_reshape_allowzero_count": normalized_reshape_allowzero,
         "unresolved_reshape_allowzero": unresolved_reshape_allowzero,
+        "materialize_static_mul_broadcasts_enabled": args.materialize_static_mul_broadcasts,
         "materialized_mul_broadcast_count": len(materialized_mul_broadcasts),
         "materialized_mul_broadcasts": materialized_mul_broadcasts,
         "lowered_contiguous_gather_nd_count": lowered_contiguous_gather_nd,
