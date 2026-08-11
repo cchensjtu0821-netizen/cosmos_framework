@@ -462,10 +462,14 @@ updates = [20, 3201, 1]
 生成两个 overwrite `ScatterND`。第一版函数式组合用 `Stack + Flatten` 恢复
 二十组 `[T,H,W]`，虽然消除了 ScatterND，但 ONNX 把 Stack 导成三个 Unsqueeze
 和 rank-4 `Concat(axis=3)`，OMG 在该 Concat 的常量折叠中发生 allocator
-corruption。当前实现改为 rank-3 `Concat(T-block,H-block,W-block) -> Reshape ->
-Transpose -> Reshape`，再 Concat 四个 temporal tail 槽；通道顺序仍严格等于
-二十组 `[T,H,W]` 加四个 T。这个变化只会进入重新执行 Step 4 产生的 raw ONNX；
-复用旧 raw ONNX 从 Step 5 开始不能验证或获得该变化。
+corruption。第二版 rank-3 `Concat -> Reshape -> Transpose -> Reshape` 避开了
+该崩溃，但仍使用 `0:60:3`、`1:60:3`、`2:60:3`；OMG 将后两段错误推成19，
+得到 `20+19+19=58`，使后续60宽度 Reshape 失败。当前实现只取连续 `:60`，
+将每个 T/H/W block Reshape 为 `[-1,20,3]`，再以 stride 1 分别取列 `0:1`、
+`1:2`、`2:3` 并沿末轴 Concat，最后恢复60宽度并追加四个 temporal tail 槽。
+通道顺序仍严格等于二十组 `[T,H,W]` 加四个 T，且不再导出 stride-3 Slice。
+这个变化只会进入重新执行 Step 4 产生的 raw ONNX；复用旧 raw ONNX 从 Step 5
+开始不能验证或获得该变化。
 
 目前保存的汇总数据没有逐节点记录每个 `N` 和 `G`，因此不能从总数唯一还原每个
 节点的 indices shape；但可以给出严格的总体边界。设 124 个节点的更新行总数为
