@@ -371,8 +371,9 @@ updates 来自 `Slice(start=1,end=60,step=3,dim=64)`；按 ONNX exclusive-end/ce
 #### 4.4.3 怎么改变
 
 1. 按 row indices 把原 data 切成未更新区间。
-2. 从 updates 中为每个目标行生成对应的单行 `Slice`。
-3. 按原 axis-0 行顺序交替排列“原 data 区间”和“update 行”。
+2. 把相邻的目标 row 合并为最大连续 run；完全连续时直接使用完整 updates，多个
+   run 时每个 run 只生成一个 updates `Slice`。
+3. 按原 axis-0 行顺序交替排列“原 data 区间”和“update run”。
 4. 使用 fan-in 不超过 64 的分层 `Concat(axis=0)` 重建完整 tensor。
 5. 不能满足条件的 ScatterND 保留并写入 report，不强行改写。
 
@@ -385,8 +386,9 @@ Concat     +3,081   929 -> 4,010
 总节点   +188,895   53,156 -> 242,051
 ```
 
-数量严格守恒：`185,938 + 3,081 - 124 = 188,895`。巨量 Slice/Concat 是逐行精确
-重建 overwrite 语义的直接代价，不是重复统计。
+这是连续 run 合并前的历史 v4 数量。数量严格守恒：
+`185,938 + 3,081 - 124 = 188,895`。巨量 Slice/Concat 是旧版逐行精确重建
+overwrite 语义的直接代价，不是重复统计。
 
 #### 4.4.5 为什么会增加 185,938 个 Slice：从 shape 计算
 
@@ -400,6 +402,8 @@ updates shape = [N, d1, d2, ...]
 
 改写只沿 axis 0 切片。后面的 `[d1,d2,...]` 每次整体保留，因此它们影响每个
 Slice 搬运的数据量，但不直接决定 Slice 节点个数。节点个数由下面两部分决定：
+
+旧版实现的节点计算规则是：
 
 1. **update Slice：固定为 `N` 个。** 每个 update row 都执行一次
    `Slice(updates, [j:j+1], axis=0)`，输出 shape 是 `[1,d1,d2,...]`。
@@ -419,6 +423,19 @@ N <= Slice_count <= 2N + 1
 - 如果更新行很稀疏、相邻 update row 之间都有未更新行，则每两个 update 之间都要
   保留一个 data Slice，`G` 接近 `N+1`，Slice 数接近 `2N+1`。
 
+当前实现再令 `R` 为目标 rows 的最大连续 run 数：
+
+```text
+update_slice_count = 0              当 R = 1（直接使用完整 updates）
+update_slice_count = R              当 R > 1
+Slice_count = G + update_slice_count
+```
+
+因此完全连续 overwrite 只需 0–2 个 data Slice 和一个最终 Concat；若覆盖 data
+全部行，连 Concat 都替换为一个 Identity。部分连续的稀疏布局也从 `N` 个 update
+Slice 降为 `R` 个。finalize report 会记录连续/分段节点数、总 update rows、run
+数、实际生成和避免生成的 update Slice 数。
+
 `node_ScatterND_239` 是可完整计算的实例：
 
 ```text
@@ -428,7 +445,7 @@ rows    = [1,4,7,...,55,58]   相邻更新行间隔 3
 updates = [20, 3201, 1]
 ```
 
-它的替代图包含：
+在旧版逐行 lowering 中，它的替代图包含：
 
 1. 20 个 update Slice，每个输出 `[1,3201,1]`；
 2. 21 个 data Slice：`[0:1]`、19 个两行的中间区间，以及 `[59:64]`；
@@ -436,7 +453,7 @@ updates = [20, 3201, 1]
 4. 41 个 piece 不超过 fan-in 64，所以再用 1 个 `Concat(axis=0)` 恢复
    `[64,3201,1]`。
 
-这里一个 ScatterND 就变成了 41 个 Slice 和 1 个 Concat。其余被处理节点中的
+历史上这里一个 ScatterND 变成了 41 个 Slice 和 1 个 Concat。其余被处理节点中的
 `N` 可以远大于 20，所以 124 个 ScatterND 最终产生 185,938 个 Slice。
 
 上述 `[1,4,7,...,58]` pattern 已定位到 Nemotron MRoPE 的高度频率写入；同一
@@ -466,7 +483,7 @@ raw ONNX 从 Step 5 开始不能验证或获得该变化。
 
 #### 4.4.6 为什么还增加 3,081 个 Concat
 
-每个 ScatterND 的 `N+G` 个 Slice 输出必须按原 axis-0 顺序拼回完整 data shape。
+旧版每个 ScatterND 的 `N+G` 个 Slice 输出必须按原 axis-0 顺序拼回完整 data shape。
 为了避免单个 Concat 输入过多，代码把 fan-in 限制为 64：
 
 1. 每 64 个 piece 先生成一个中间 Concat；

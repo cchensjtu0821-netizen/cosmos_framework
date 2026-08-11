@@ -417,9 +417,38 @@ def _lower_fixed_gather_nd(graph, resolve, onnx) -> tuple[int, int, list[str]]:
     return contiguous_count, segmented_count, unresolved
 
 
+def _consecutive_row_runs(rows) -> list[tuple[int, int, int, int]]:
+    """Return update-index and data-row bounds for maximal consecutive runs."""
+
+    if len(rows) == 0:
+        return []
+    runs: list[tuple[int, int, int, int]] = []
+    update_start = 0
+    for update_end in range(1, len(rows)):
+        if int(rows[update_end]) != int(rows[update_end - 1]) + 1:
+            runs.append(
+                (
+                    update_start,
+                    update_end,
+                    int(rows[update_start]),
+                    int(rows[update_end - 1]) + 1,
+                )
+            )
+            update_start = update_end
+    runs.append(
+        (
+            update_start,
+            len(rows),
+            int(rows[update_start]),
+            int(rows[-1]) + 1,
+        )
+    )
+    return runs
+
+
 def _normalize_scatter_nd_for_omg(
     graph, resolve, onnx
-) -> tuple[int, int, int, list[str], list[dict[str, object]]]:
+) -> tuple[int, int, int, dict[str, int], list[str], list[dict[str, object]]]:
     """Lower validated row-wise ScatterND patterns for OMG compatibility."""
     import numpy as np
 
@@ -459,6 +488,14 @@ def _normalize_scatter_nd_for_omg(
     removed_none = 0
     lowered_add = 0
     lowered_overwrite = 0
+    overwrite_stats = {
+        "contiguous_count": 0,
+        "segmented_count": 0,
+        "update_row_count": 0,
+        "update_run_count": 0,
+        "generated_update_slice_count": 0,
+        "avoided_update_slice_count": 0,
+    }
     unresolved: list[str] = []
 
     for node in list(graph.node):
@@ -524,50 +561,61 @@ def _normalize_scatter_nd_for_omg(
             concat_inputs: list[str] = []
             piece_sizes: dict[str, int] = {}
             cursor = 0
+            runs = _consecutive_row_runs(rows)
+            generated_update_slices = 0 if len(runs) == 1 else len(runs)
+            overwrite_stats["contiguous_count" if len(runs) == 1 else "segmented_count"] += 1
+            overwrite_stats["update_row_count"] += int(rows.size)
+            overwrite_stats["update_run_count"] += len(runs)
+            overwrite_stats["generated_update_slice_count"] += generated_update_slices
+            overwrite_stats["avoided_update_slice_count"] += int(rows.size) - generated_update_slices
 
-            for update_index, row_value in enumerate(rows):
-                row = int(row_value)
-                if cursor < row:
-                    data_piece = unique(f"{node.output[0]}_data_{cursor}_{row}")
+            for run_index, (update_start, update_end, row_start, row_end) in enumerate(runs):
+                if cursor < row_start:
+                    data_piece = unique(f"{node.output[0]}_data_{cursor}_{row_start}")
                     replacement.append(
                         onnx.helper.make_node(
                             "Slice",
-                            [data_name, scalar(cursor), scalar(row), axis, step],
+                            [data_name, scalar(cursor), scalar(row_start), axis, step],
                             [data_piece],
-                            name=unique(f"{prefix}_data_slice_{cursor}_{row}"),
+                            name=unique(f"{prefix}_data_slice_{cursor}_{row_start}"),
                         )
                     )
-                    piece_sizes[data_piece] = row - cursor
+                    piece_sizes[data_piece] = row_start - cursor
                     graph.value_info.append(
                         onnx.helper.make_tensor_value_info(
-                            data_piece, element_type, [row - cursor, *data_shape[1:]]
+                            data_piece, element_type, [row_start - cursor, *data_shape[1:]]
                         )
                     )
                     concat_inputs.append(data_piece)
 
-                update_piece = unique(f"{node.output[0]}_update_{update_index}")
-                replacement.append(
-                    onnx.helper.make_node(
-                        "Slice",
-                        [
-                            updates_name,
-                            scalar(update_index),
-                            scalar(update_index + 1),
-                            axis,
-                            step,
-                        ],
-                        [update_piece],
-                        name=unique(f"{prefix}_update_slice_{update_index}"),
+                if len(runs) == 1:
+                    update_piece = updates_name
+                else:
+                    update_piece = unique(f"{node.output[0]}_update_run_{run_index}")
+                    replacement.append(
+                        onnx.helper.make_node(
+                            "Slice",
+                            [
+                                updates_name,
+                                scalar(update_start),
+                                scalar(update_end),
+                                axis,
+                                step,
+                            ],
+                            [update_piece],
+                            name=unique(f"{prefix}_update_slice_{update_start}_{update_end}"),
+                        )
                     )
-                )
-                piece_sizes[update_piece] = 1
-                graph.value_info.append(
-                    onnx.helper.make_tensor_value_info(
-                        update_piece, element_type, [1, *data_shape[1:]]
+                    graph.value_info.append(
+                        onnx.helper.make_tensor_value_info(
+                            update_piece,
+                            element_type,
+                            [update_end - update_start, *data_shape[1:]],
+                        )
                     )
-                )
+                piece_sizes[update_piece] = update_end - update_start
                 concat_inputs.append(update_piece)
-                cursor = row + 1
+                cursor = row_end
 
             if cursor < data_shape[0]:
                 data_piece = unique(f"{node.output[0]}_data_{cursor}_{data_shape[0]}")
@@ -619,15 +667,25 @@ def _normalize_scatter_nd_for_omg(
                 concat_inputs = grouped
                 level += 1
 
-            replacement.append(
-                onnx.helper.make_node(
-                    "Concat",
-                    concat_inputs,
-                    [node.output[0]],
-                    axis=0,
-                    name=unique(f"{prefix}_concat_final"),
+            if len(concat_inputs) == 1:
+                replacement.append(
+                    onnx.helper.make_node(
+                        "Identity",
+                        concat_inputs,
+                        [node.output[0]],
+                        name=unique(f"{prefix}_identity"),
+                    )
                 )
-            )
+            else:
+                replacement.append(
+                    onnx.helper.make_node(
+                        "Concat",
+                        concat_inputs,
+                        [node.output[0]],
+                        axis=0,
+                        name=unique(f"{prefix}_concat_final"),
+                    )
+                )
             graph.node.remove(node)
             for offset, replacement_node in enumerate(replacement):
                 graph.node.insert(node_index + offset, replacement_node)
@@ -736,7 +794,7 @@ def _normalize_scatter_nd_for_omg(
         for node in graph.node
         if node.op_type == "ScatterND"
     ]
-    return removed_none, lowered_add, lowered_overwrite, unresolved, remaining
+    return removed_none, lowered_add, lowered_overwrite, overwrite_stats, unresolved, remaining
 
 
 def main() -> None:
@@ -784,6 +842,7 @@ def main() -> None:
         removed_scatter_nd_none,
         lowered_scatter_nd_add,
         lowered_scatter_nd_overwrite,
+        scatter_nd_overwrite_stats,
         unresolved_scatter_nd_reduction,
         remaining_scatter_nd,
     ) = _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
@@ -866,6 +925,20 @@ def main() -> None:
         "removed_explicit_scatter_nd_none_count": removed_scatter_nd_none,
         "lowered_scatter_nd_add_count": lowered_scatter_nd_add,
         "lowered_scatter_nd_overwrite_count": lowered_scatter_nd_overwrite,
+        "lowered_contiguous_scatter_nd_overwrite_count": scatter_nd_overwrite_stats[
+            "contiguous_count"
+        ],
+        "lowered_segmented_scatter_nd_overwrite_count": scatter_nd_overwrite_stats[
+            "segmented_count"
+        ],
+        "scatter_nd_overwrite_update_row_count": scatter_nd_overwrite_stats["update_row_count"],
+        "scatter_nd_overwrite_update_run_count": scatter_nd_overwrite_stats["update_run_count"],
+        "scatter_nd_overwrite_generated_update_slice_count": scatter_nd_overwrite_stats[
+            "generated_update_slice_count"
+        ],
+        "scatter_nd_overwrite_avoided_update_slice_count": scatter_nd_overwrite_stats[
+            "avoided_update_slice_count"
+        ],
         "unresolved_scatter_nd_reduction": unresolved_scatter_nd_reduction,
         "remaining_scatter_nd_count": len(remaining_scatter_nd),
         "remaining_scatter_nd": remaining_scatter_nd,
