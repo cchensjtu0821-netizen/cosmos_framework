@@ -18,8 +18,8 @@ def _normalized(name: str) -> str:
     return value
 
 
-def _gemm_weight_name(node, initializer_names: set[str]) -> tuple[str | None, list[str]]:
-    """Return the module path for a Gemm's unique direct weight initializer."""
+def _linear_weight_name(node, initializer_names: set[str]) -> tuple[str | None, list[str]]:
+    """Return the module path for a Gemm/MatMul's unique direct weight initializer."""
 
     weight_inputs = [
         input_name
@@ -851,6 +851,7 @@ def main() -> None:
     empty_before = 0
     renamed = 0
     gemm_nodes = 0
+    linear_matmul_nodes = 0
     gemm_weight_renamed = 0
     gemm_weight_mappings: list[dict[str, object]] = []
     unresolved_gemm_nodes: list[dict[str, object]] = []
@@ -858,13 +859,16 @@ def main() -> None:
         original = node.name
         base = _normalized(original) if original else f"{node.op_type}_{index}"
         weight_input = None
-        if node.op_type == "Gemm":
-            gemm_nodes += 1
-            module_name, weight_inputs = _gemm_weight_name(node, initializer_names)
+        if node.op_type in {"Gemm", "MatMul"}:
+            module_name, weight_inputs = _linear_weight_name(node, initializer_names)
+            if node.op_type == "Gemm":
+                gemm_nodes += 1
+            elif module_name is not None:
+                linear_matmul_nodes += 1
             if module_name is not None:
                 base = module_name
                 weight_input = weight_inputs[0]
-            else:
+            elif node.op_type == "Gemm":
                 unresolved_gemm_nodes.append(
                     {
                         "index": index,
@@ -948,6 +952,7 @@ def main() -> None:
         "high_rank_graph_io_count": rank_summary["high_rank_graph_io_count"],
         "high_rank_graph_io": rank_audit["high_rank_graph_io"],
         "gemm_nodes": gemm_nodes,
+        "linear_matmul_nodes": linear_matmul_nodes,
         "gemm_weight_renamed": gemm_weight_renamed,
         "gemm_weight_mappings": gemm_weight_mappings,
         "unresolved_gemm_nodes": unresolved_gemm_nodes,

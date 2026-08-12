@@ -18,6 +18,7 @@ COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避
 COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转换 OMC
 COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用 raw ONNX，从 Step 5 继续到底
 COSMOS3_MATERIALIZE_MUL_BROADCASTS="${COSMOS3_MATERIALIZE_MUL_BROADCASTS:-0}"  # 默认保留历史隐式 Mul 广播
+COSMOS3_DECOMPOSE_GEMM="${COSMOS3_DECOMPOSE_GEMM:-0}"  # Step 5 可选 Gemm -> MatMul + optional Add
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
@@ -129,14 +130,20 @@ elif [[ ! -f "${COSMOS3_ONNX_RAW}" ]]; then
 fi
 
 echo "========== Step 5: apply Cosmos3 Policy compatibility rewrites =========="
-if ! python3 scripts/rewrite_action_policy_onnx.py \
-    "${COSMOS3_ONNX_RAW}" \
-    "${COSMOS3_ONNX_COMPATIBLE}" \
-    --prompt-embedding-table-path "${COSMOS3_PROMPT_EMBEDDING}" \
-    --report-path "${COSMOS3_REWRITE_REPORT}" \
-    --verify-equivalence \
-    --verification-provider CUDAExecutionProvider \
+REWRITE_ARGS=(
+    scripts/rewrite_action_policy_onnx.py
+    "${COSMOS3_ONNX_RAW}"
+    "${COSMOS3_ONNX_COMPATIBLE}"
+    --prompt-embedding-table-path "${COSMOS3_PROMPT_EMBEDDING}"
+    --report-path "${COSMOS3_REWRITE_REPORT}"
+    --verify-equivalence
+    --verification-provider CUDAExecutionProvider
     --verification-provider CPUExecutionProvider
+)
+if [[ "${COSMOS3_DECOMPOSE_GEMM}" == "1" ]]; then
+    REWRITE_ARGS+=(--decompose-gemm)
+fi
+if ! python3 "${REWRITE_ARGS[@]}"
 then
     rm -f -- \
         "${COSMOS3_ONNX_COMPATIBLE}" \

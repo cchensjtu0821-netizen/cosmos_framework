@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from cosmos_framework.onnxsrc.finalize_onnx import _consecutive_row_runs
+from cosmos_framework.onnxsrc.finalize_onnx import _consecutive_row_runs, _linear_weight_name
 
 
 class ConsecutiveRowRunsTest(unittest.TestCase):
@@ -29,6 +29,19 @@ class ConsecutiveRowRunsTest(unittest.TestCase):
 
     def test_single_row(self) -> None:
         self.assertEqual(_consecutive_row_runs([5]), [(0, 1, 5, 6)])
+
+
+class LinearWeightNameTest(unittest.TestCase):
+    def test_matmul_direct_weight_maps_to_module_name(self) -> None:
+        node = type("Node", (), {"input": ["hidden", "net.layers.0.linear.weight"]})()
+        self.assertEqual(
+            _linear_weight_name(node, {"net.layers.0.linear.weight"}),
+            ("layers.0.linear", ["net.layers.0.linear.weight"]),
+        )
+
+    def test_dynamic_matmul_is_not_treated_as_linear(self) -> None:
+        node = type("Node", (), {"input": ["query", "key"]})()
+        self.assertEqual(_linear_weight_name(node, set()), (None, []))
 
 
 if __name__ == "__main__":

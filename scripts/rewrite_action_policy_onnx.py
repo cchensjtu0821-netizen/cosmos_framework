@@ -332,6 +332,107 @@ def _rewrite_unary_einsum(graph: Any, onnx: Any, changes: list[dict[str, Any]]) 
     return count
 
 
+def _decompose_gemm_nodes(
+    graph: Any,
+    onnx: Any,
+    changes: list[dict[str, Any]],
+) -> int:
+    """Decompose default-scale Gemm into Transpose/MatMul and optional Add."""
+    rewritten_nodes: list[Any] = []
+    count = 0
+    for node in graph.node:
+        if node.op_type != "Gemm":
+            rewritten_nodes.append(node)
+            continue
+        if len(node.input) not in {2, 3} or len(node.output) != 1:
+            raise ValueError(
+                f"Cannot decompose Gemm {node.name!r}: expected 2 or 3 inputs and one output, "
+                f"got inputs={list(node.input)!r}, outputs={list(node.output)!r}"
+            )
+
+        has_bias = len(node.input) == 3 and bool(node.input[2])
+        alpha = float(_attribute(node, "alpha", onnx, 1.0))
+        beta = float(_attribute(node, "beta", onnx, 1.0))
+        trans_a = int(_attribute(node, "transA", onnx, 0))
+        trans_b = int(_attribute(node, "transB", onnx, 0))
+        if alpha != 1.0 or (has_bias and beta != 1.0):
+            raise ValueError(
+                f"Cannot decompose Gemm {node.name!r} without inserting dtype-sensitive scales: "
+                f"alpha={alpha}, beta={beta}"
+            )
+        if trans_a not in {0, 1} or trans_b not in {0, 1}:
+            raise ValueError(
+                f"Cannot decompose Gemm {node.name!r}: transA={trans_a}, transB={trans_b}"
+            )
+
+        left = node.input[0]
+        right = node.input[1]
+        inserted_transposes: list[str] = []
+        if trans_a:
+            transposed_left = _unique_name(graph, f"{node.output[0]}_gemm_transpose_a")
+            transpose_a = onnx.helper.make_node(
+                "Transpose",
+                [left],
+                [transposed_left],
+                name=f"{node.name or node.output[0]}__transpose_a",
+                perm=[1, 0],
+            )
+            rewritten_nodes.append(transpose_a)
+            left = transposed_left
+            inserted_transposes.append("A")
+        if trans_b:
+            transposed_right = _unique_name(graph, f"{node.output[0]}_gemm_transpose_b")
+            transpose_b = onnx.helper.make_node(
+                "Transpose",
+                [right],
+                [transposed_right],
+                name=f"{node.name or node.output[0]}__transpose_b",
+                perm=[1, 0],
+            )
+            rewritten_nodes.append(transpose_b)
+            right = transposed_right
+            inserted_transposes.append("B")
+
+        matmul_output = (
+            _unique_name(graph, f"{node.output[0]}_gemm_matmul") if has_bias else node.output[0]
+        )
+        matmul = onnx.helper.make_node(
+            "MatMul",
+            [left, right],
+            [matmul_output],
+            # Keep the original quantized linear node name on MatMul. Step 6
+            # can then recover its module name from the direct weight input.
+            name=node.name,
+        )
+        rewritten_nodes.append(matmul)
+        if has_bias:
+            rewritten_nodes.append(
+                onnx.helper.make_node(
+                    "Add",
+                    [matmul_output, node.input[2]],
+                    [node.output[0]],
+                    name=f"{node.name or node.output[0]}__bias_add",
+                )
+            )
+
+        changes.append(
+            {
+                "kind": "exact",
+                "node": node.name,
+                "rewrite": "Gemm->MatMul" + ("+Add" if has_bias else ""),
+                "has_bias": has_bias,
+                "transposed_inputs": inserted_transposes,
+                "alpha": alpha,
+                "beta": beta if has_bias else None,
+            }
+        )
+        count += 1
+
+    del graph.node[:]
+    graph.node.extend(rewritten_nodes)
+    return count
+
+
 def _rewrite_constant_of_shape(
     model_path: Path,
     graph: Any,
@@ -1262,6 +1363,7 @@ def _apply_rewrites(
     prompt_embedding_table_path: Path,
     onnx: Any,
     lower_vision_ranks: bool,
+    decompose_gemm: bool = False,
     keep_causal_where: bool = False,
     keep_scatter_elements: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
@@ -1294,6 +1396,7 @@ def _apply_rewrites(
         "causal_where": (
             0 if keep_causal_where else _rewrite_causal_where_additive(graph, evaluator, onnx, changes)
         ),
+        "gemm": _decompose_gemm_nodes(graph, onnx, changes) if decompose_gemm else 0,
     }
     counts["nd_indices"] = _normalize_nd_indices(graph, onnx, changes)
     _prune_unused(graph)
@@ -1339,6 +1442,7 @@ def rewrite_model(
     keep_causal_where: bool = False,
     keep_vision_ranks: bool = False,
     keep_scatter_elements: bool = False,
+    decompose_gemm: bool = False,
 ) -> dict[str, Any]:
     try:
         import onnx
@@ -1358,6 +1462,7 @@ def rewrite_model(
         lower_vision_ranks=not keep_vision_ranks,
         keep_causal_where=keep_causal_where,
         keep_scatter_elements=keep_scatter_elements,
+        decompose_gemm=decompose_gemm,
     )
     onnx.save_model(model, str(output_path))
     _infer_shapes_in_place(output_path, onnx)
@@ -1409,6 +1514,7 @@ def rewrite_model(
         "diagnostic_keep_causal_where": keep_causal_where,
         "diagnostic_keep_vision_ranks": keep_vision_ranks,
         "diagnostic_keep_scatter_elements": keep_scatter_elements,
+        "decompose_gemm": decompose_gemm,
         "counts": counts,
         "remaining_target_nodes": remaining,
         "remaining_high_rank_nodes": remaining_high_rank_nodes,
@@ -1418,7 +1524,8 @@ def rewrite_model(
         "verification": verification,
         "equivalence": {
             "exact_rewrites": (
-                "Einsum, ConstantOfShape, constant/scalar Gather, and validated ScatterElements patterns."
+                "Einsum, ConstantOfShape, constant/scalar Gather, validated ScatterElements patterns, "
+                "and enabled default-scale Gemm decomposition."
             ),
             "fixed_configuration": f"action_domain_id is frozen to {domain_id}.",
             "interface_requirement": (
@@ -1446,6 +1553,11 @@ def main() -> None:
     parser.add_argument("--prompt-embedding-table-path", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("--verify-equivalence", action="store_true")
+    parser.add_argument(
+        "--decompose-gemm",
+        action="store_true",
+        help="Rewrite default-scale Gemm as MatMul and add bias only when a third input exists.",
+    )
     parser.add_argument(
         "--verification-provider",
         action="append",
@@ -1500,6 +1612,7 @@ def main() -> None:
         keep_causal_where=args.keep_causal_where,
         keep_vision_ranks=args.keep_vision_ranks,
         keep_scatter_elements=args.keep_scatter_elements,
+        decompose_gemm=args.decompose_gemm,
     )
     report_path = args.report_path or args.output_path.with_suffix(args.output_path.suffix + ".rewrite.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
