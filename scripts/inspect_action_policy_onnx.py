@@ -23,6 +23,7 @@ DEFAULT_TARGET_OPS = (
     "ConstantOfShape",
     "Einsum",
     "Gather",
+    "Pow",
     "ScatterElements",
     "Where",
 )
@@ -31,6 +32,7 @@ REWRITE_HINTS = {
     "ConstantOfShape": "Fold fixed shapes to an initializer, or use scalar + Expand.",
     "Einsum": "Lower the node's equation to Transpose/Reshape/MatMul or Mul/ReduceSum.",
     "Gather": "Fold constant indices, use Slice for contiguous indices, or move embedding lookup outside ONNX.",
+    "Pow": "Replace fixed tensor squares with Mul(x, x) in the exported model source.",
     "ScatterElements": "Replace fixed-index writes with Slice/Concat or a constant mapping matrix.",
     "Where": "Fold a constant condition; arithmetic masking is safe only when NaN/Inf semantics are controlled.",
 }
