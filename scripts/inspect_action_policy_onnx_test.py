@@ -19,7 +19,9 @@ class TargetOperatorTest(unittest.TestCase):
             / "model/generator/reasoner/nemotron_3_dense_vl/nemotron_3_dense_vl.py"
         ).read_text()
         self.assertNotIn(".square()", source)
+        self.assertIn("class ReLUSquaredMulActivation(nn.Module)", source)
         self.assertIn("return activated * activated", source)
+        self.assertIn('ACT2FN["relu2"] = ReLUSquaredMulActivation', source)
 
 
 if __name__ == "__main__":

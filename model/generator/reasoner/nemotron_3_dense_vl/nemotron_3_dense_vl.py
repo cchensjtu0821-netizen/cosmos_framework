@@ -13,15 +13,17 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 
-def relu_squared_mul(x: torch.Tensor) -> torch.Tensor:
+class ReLUSquaredMulActivation(nn.Module):
     """Compute ReLU² without exporting an ONNX Pow node."""
-    activated = F.relu(x)
-    return activated * activated
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        activated = F.relu(x)
+        return activated * activated
 
 
 # Override the Transformers implementation as well as supplying the activation
 # when older Transformers versions do not define it.
-ACT2FN["relu2"] = relu_squared_mul
+ACT2FN["relu2"] = ReLUSquaredMulActivation
 from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.modeling_utils import PreTrainedModel
 
@@ -82,7 +84,7 @@ class Nemotron3DenseVLMLP(nn.Module):
         if config.mlp_hidden_act in ACT2FN:
             self.act_fn = ACT2FN[config.mlp_hidden_act]
         else:
-            self.act_fn = relu_squared_mul
+            self.act_fn = ReLUSquaredMulActivation()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.up_proj(x)))
