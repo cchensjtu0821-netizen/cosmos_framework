@@ -43,6 +43,22 @@ class LinearWeightNameTest(unittest.TestCase):
         node = type("Node", (), {"input": ["query", "key"]})()
         self.assertEqual(_linear_weight_name(node, set()), (None, []))
 
+    def test_matmul_traces_weight_through_transpose(self) -> None:
+        node = type("Node", (), {"input": ["hidden", "transposed_weight"]})()
+        transpose = type(
+            "Node",
+            (),
+            {"op_type": "Transpose", "input": ["net.layers.0.linear.weight"]},
+        )()
+        self.assertEqual(
+            _linear_weight_name(
+                node,
+                {"net.layers.0.linear.weight"},
+                {"transposed_weight": transpose},
+            ),
+            ("layers.0.linear", ["net.layers.0.linear.weight"]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

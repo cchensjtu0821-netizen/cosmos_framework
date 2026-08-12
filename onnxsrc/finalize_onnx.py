@@ -18,14 +18,22 @@ def _normalized(name: str) -> str:
     return value
 
 
-def _linear_weight_name(node, initializer_names: set[str]) -> tuple[str | None, list[str]]:
-    """Return the module path for a Gemm/MatMul's unique direct weight initializer."""
+def _linear_weight_name(
+    node,
+    initializer_names: set[str],
+    producers: dict[str, object] | None = None,
+) -> tuple[str | None, list[str]]:
+    """Return the module path for a linear node's direct or transposed weight."""
 
-    weight_inputs = [
-        input_name
-        for input_name in node.input
-        if input_name in initializer_names and _normalized(input_name).endswith(".weight")
-    ]
+    producers = producers or {}
+    weight_inputs: list[str] = []
+    for input_name in node.input:
+        candidate = input_name
+        producer = producers.get(input_name)
+        if producer is not None and producer.op_type == "Transpose" and len(producer.input) == 1:
+            candidate = producer.input[0]
+        if candidate in initializer_names and _normalized(candidate).endswith(".weight"):
+            weight_inputs.append(candidate)
     if len(weight_inputs) != 1:
         return None, weight_inputs
 
@@ -847,6 +855,12 @@ def main() -> None:
         remaining_scatter_nd,
     ) = _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
     initializer_names = {initializer.name for initializer in model.graph.initializer}
+    producers = {
+        output_name: node
+        for node in model.graph.node
+        for output_name in node.output
+        if output_name
+    }
     used: set[str] = set()
     empty_before = 0
     renamed = 0
@@ -860,7 +874,7 @@ def main() -> None:
         base = _normalized(original) if original else f"{node.op_type}_{index}"
         weight_input = None
         if node.op_type in {"Gemm", "MatMul"}:
-            module_name, weight_inputs = _linear_weight_name(node, initializer_names)
+            module_name, weight_inputs = _linear_weight_name(node, initializer_names, producers)
             if node.op_type == "Gemm":
                 gemm_nodes += 1
             elif module_name is not None:
