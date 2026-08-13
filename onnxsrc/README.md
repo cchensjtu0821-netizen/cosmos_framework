@@ -23,14 +23,18 @@ sampler, CFG loop, or action postprocessing.
    included in the ONNX; deployment quantization remains in `quant_params_v2`
    and is applied by the downstream ONNX-to-OM flow. After serialization,
    `onnxslim` performs additional constant folding and graph simplification.
-   External tensors are then repacked into one `.onnx.data` file. Any
+   External tensors are then repacked into one `<model>.onnx.pb` file by
+   default. Set `COSMOS3_EXTERNAL_DATA_USE_PB=0` when running the full pipeline
+   to retain the former `<model>.onnx.data` naming. The main ONNX `location`
+   metadata and OMG `--weight` path are updated together. Any
    FP16/BF16 initializer fails validation.
    A pre-export audit rejects parameters, buffers, unregistered tensor
    attributes, or inputs found on the wrong device. The resulting clean ONNX keeps the
    original export's FP32 floating boundary and fails if any FP16/BF16
    initializer remains; INT8 deployment parameters stay in the DOPT quant
    files rather than changing ONNX graph I/O to INT8. Legacy export shards are
-   consolidated by default into one `<model>.onnx.data` file; the source shard
+   consolidated by default into one `<model>.onnx.pb` file (or
+   `<model>.onnx.data` with the switch disabled); the source shard
    files are removed only after the consolidated model passes ONNX checker.
    Constants below 1 MiB remain inline so Slice axes, Reshape shapes, and other
    control tensors are available to path-based ONNX shape inference. The

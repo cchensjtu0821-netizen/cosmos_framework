@@ -140,7 +140,11 @@ def _verify_no_embedded_quantization(model_path: Path, onnx: Any) -> dict[str, i
     }
 
 
-def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
+def _consolidate_external_data(
+    model_path: Path,
+    onnx: Any,
+    data_path: Path | None = None,
+) -> Path:
     lightweight_model = onnx.load_model(str(model_path), load_external_data=False)
     old_locations = {
         entry.value
@@ -148,9 +152,16 @@ def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
         for entry in tensor.external_data
         if entry.key == "location"
     }
-    data_path = model_path.with_suffix(model_path.suffix + ".data")
+    data_path = data_path or model_path.with_suffix(model_path.suffix + ".data")
+    if data_path.resolve().parent != model_path.resolve().parent:
+        raise ValueError(
+            "ONNX external data must be stored beside the model: "
+            f"model={model_path}, external_data={data_path}"
+        )
+    if data_path.resolve() == model_path.resolve():
+        raise ValueError("ONNX model and external-data paths must be different")
 
-    # Dynamo may already use the exact final ``.onnx.data`` name. Load every
+    # Dynamo may already use the requested final external-data name. Load every
     # external tensor into the ModelProto before removing that source file.
     model = onnx.load_model(str(model_path), load_external_data=True)
     data_path.unlink(missing_ok=True)
@@ -192,7 +203,11 @@ def _consolidate_external_data(model_path: Path, onnx: Any) -> Path:
     return data_path
 
 
-def _simplify_onnx_in_place(model_path: Path, onnx: Any) -> None:
+def _simplify_onnx_in_place(
+    model_path: Path,
+    onnx: Any,
+    external_data_path: Path | None = None,
+) -> None:
     """Fold constants and simplify a large external-data ONNX in place."""
     try:
         import onnxslim
@@ -224,8 +239,9 @@ def _simplify_onnx_in_place(model_path: Path, onnx: Any) -> None:
         onnx.checker.check_model(str(simplified_path))
         simplified_path.replace(model_path)
         # onnxslim names external data after its temporary output. Repack it
-        # immediately so the final artifact again has one stable .onnx.data.
-        _consolidate_external_data(model_path, onnx)
+        # immediately so the final artifact again has one stable external-data
+        # file with the caller-selected name.
+        _consolidate_external_data(model_path, onnx, external_data_path)
     finally:
         simplified_path.unlink(missing_ok=True)
         for temporary_artifact in model_path.parent.glob(f"{simplified_path.name}*"):
@@ -258,6 +274,14 @@ def main() -> None:
         choices=("single", "sharded"),
         default="single",
         help="Consolidate all external tensors into one .onnx.data file by default.",
+    )
+    parser.add_argument(
+        "--external-data-path",
+        type=Path,
+        help=(
+            "Path for the single external tensor-data file; it must be beside "
+            "--output and defaults to <output>.data. The suffix may be .pb."
+        ),
     )
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -325,12 +349,19 @@ def main() -> None:
 
     import onnx
 
+    requested_external_data_path = args.external_data_path or args.output.with_suffix(
+        args.output.suffix + ".data"
+    )
     external_data_path = None
     if args.external_data_mode == "single":
-        external_data_path = _consolidate_external_data(args.output, onnx)
-    _simplify_onnx_in_place(args.output, onnx)
+        external_data_path = _consolidate_external_data(
+            args.output,
+            onnx,
+            requested_external_data_path,
+        )
+    _simplify_onnx_in_place(args.output, onnx, requested_external_data_path)
     if args.external_data_mode == "single":
-        external_data_path = args.output.with_suffix(args.output.suffix + ".data")
+        external_data_path = requested_external_data_path
     onnx.checker.check_model(str(args.output))
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)

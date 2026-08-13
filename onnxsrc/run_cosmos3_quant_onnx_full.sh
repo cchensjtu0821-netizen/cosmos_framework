@@ -13,7 +13,8 @@ COSMOS3_LAYOUT_MANIFEST="${COSMOS3_LAYOUT_MANIFEST:-/srv/data2/c00932551/Nvidia_
 COSMOS3_CONDITION_VISION_FRAMES="${COSMOS3_CONDITION_VISION_FRAMES:-0}"
 COSMOS3_CONDITION_ACTION_FRAMES="${COSMOS3_CONDITION_ACTION_FRAMES:-0}"
 COSMOS3_EMBEDDING_SEPARATE="${COSMOS3_EMBEDDING_SEPARATE:-0}"  # 默认只生成主量化文件
-COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个 .onnx.data
+COSMOS3_EXTERNAL_DATA_MODE="${COSMOS3_EXTERNAL_DATA_MODE:-single}"  # 合并为单个外部权重文件
+COSMOS3_EXTERNAL_DATA_USE_PB="${COSMOS3_EXTERNAL_DATA_USE_PB:-1}"  # 默认 1: .onnx.pb; 0: .onnx.data
 COSMOS3_CLEAN_OUTPUT="${COSMOS3_CLEAN_OUTPUT:-1}"  # 默认删除旧输出，避免历史文件混入
 COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转换 OMC
 COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用 raw ONNX，从 Step 5 继续到底
@@ -21,6 +22,12 @@ COSMOS3_MATERIALIZE_MUL_BROADCASTS="${COSMOS3_MATERIALIZE_MUL_BROADCASTS:-0}"  #
 COSMOS3_DECOMPOSE_GEMM="${COSMOS3_DECOMPOSE_GEMM:-0}"  # Step 5 可选 Gemm -> MatMul + optional Add
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
+
+case "${COSMOS3_EXTERNAL_DATA_USE_PB}" in
+    0) COSMOS3_EXTERNAL_DATA_SUFFIX=".data" ;;
+    1) COSMOS3_EXTERNAL_DATA_SUFFIX=".pb" ;;
+    *) echo "COSMOS3_EXTERNAL_DATA_USE_PB must be 0 or 1" >&2; exit 2 ;;
+esac
 
 if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
     echo "Cosmos3 repository directory not found: ${COSMOS3_REPO_DIR}" >&2
@@ -68,9 +75,14 @@ COSMOS3_FAKEQUANT_WEIGHT="${COSMOS3_QUANT_ROOT}/fakequant_weight.pth"
 COSMOS3_QUANT_OUTPUT_DIR="${COSMOS3_QUANT_ROOT}/quant_params"
 COSMOS3_QUANT_PARAMS_FILE="${COSMOS3_QUANT_PARAMS_FILE:-${COSMOS3_QUANT_OUTPUT_DIR}_v2}"
 COSMOS3_ONNX_RAW="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.onnx"
-COSMOS3_ONNX_WEIGHT="${COSMOS3_ONNX_WEIGHT:-${COSMOS3_ONNX_RAW}.data}"
 COSMOS3_ONNX_COMPATIBLE="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.onnx"
 COSMOS3_ONNX_FINAL="${COSMOS3_QUANT_ROOT}/edge_policy.int8_fakequant.compatible.named.onnx"
+if [[ "${COSMOS3_EXTERNAL_DATA_USE_PB}" == "1" ]]; then
+    COSMOS3_EXTERNAL_DATA_DEFAULT="${COSMOS3_ONNX_FINAL}${COSMOS3_EXTERNAL_DATA_SUFFIX}"
+else
+    COSMOS3_EXTERNAL_DATA_DEFAULT="${COSMOS3_ONNX_RAW}${COSMOS3_EXTERNAL_DATA_SUFFIX}"
+fi
+COSMOS3_ONNX_WEIGHT="${COSMOS3_ONNX_WEIGHT:-${COSMOS3_EXTERNAL_DATA_DEFAULT}}"
 COSMOS3_REWRITE_REPORT="${COSMOS3_ONNX_COMPATIBLE}.rewrite.json"
 COSMOS3_PROMPT_EMBEDDING="${COSMOS3_ONNX_COMPATIBLE}.prompt_embedding.npy"
 COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
@@ -123,9 +135,13 @@ if [[ "${COSMOS3_START_STEP5}" != "1" ]]; then
     python3 "${COSMOS3_ONNX_SRC_DIR}/convert_cosmos3_to_onnx.py" \
         --output "${COSMOS3_ONNX_RAW}" \
         --external-data-mode "${COSMOS3_EXTERNAL_DATA_MODE}" \
+        --external-data-path "${COSMOS3_ONNX_WEIGHT}" \
         "${COMMON_ARGS[@]}"
 elif [[ ! -f "${COSMOS3_ONNX_RAW}" ]]; then
     echo "Step 5 input ONNX not found: ${COSMOS3_ONNX_RAW}" >&2
+    exit 1
+elif [[ ! -f "${COSMOS3_ONNX_WEIGHT}" ]]; then
+    echo "Step 5 input ONNX external data not found: ${COSMOS3_ONNX_WEIGHT}" >&2
     exit 1
 fi
 
