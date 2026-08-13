@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
-from cosmos_framework.onnxsrc.finalize_onnx import _consecutive_row_runs, _linear_weight_name
+from cosmos_framework.onnxsrc.finalize_onnx import (
+    _consecutive_row_runs,
+    _linear_weight_name,
+    _prune_unreachable_nodes,
+)
 
 
 class ConsecutiveRowRunsTest(unittest.TestCase):
@@ -58,6 +63,59 @@ class LinearWeightNameTest(unittest.TestCase):
             ),
             ("layers.0.linear", ["net.layers.0.linear.weight"]),
         )
+
+
+class PruneUnreachableNodesTest(unittest.TestCase):
+    @staticmethod
+    def _node(name: str, op_type: str, inputs: list[str], outputs: list[str]):
+        return SimpleNamespace(
+            name=name,
+            op_type=op_type,
+            input=inputs,
+            output=outputs,
+            attribute=[],
+        )
+
+    def test_removes_dead_cast_but_preserves_live_cast(self) -> None:
+        graph = SimpleNamespace(
+            node=[
+                self._node("live_cast", "Cast", ["input"], ["live"]),
+                self._node("output_add", "Add", ["live", "bias"], ["output"]),
+                self._node("dead_cast", "Cast", ["dead_indices"], ["dead"]),
+            ],
+            input=[SimpleNamespace(name="input")],
+            output=[SimpleNamespace(name="output")],
+            initializer=[SimpleNamespace(name="bias"), SimpleNamespace(name="dead_indices")],
+            value_info=[SimpleNamespace(name="live"), SimpleNamespace(name="dead")],
+        )
+
+        report = _prune_unreachable_nodes(graph)
+
+        self.assertFalse(report["skipped"])
+        self.assertEqual(report["removed_node_count"], 1)
+        self.assertEqual(report["removed_node_op_counts"], {"Cast": 1})
+        self.assertEqual([node.name for node in graph.node], ["live_cast", "output_add"])
+        self.assertEqual([tensor.name for tensor in graph.initializer], ["bias"])
+        self.assertEqual([value.name for value in graph.value_info], ["live"])
+
+    def test_preserves_shared_dependency_reachable_from_output(self) -> None:
+        graph = SimpleNamespace(
+            node=[
+                self._node("source", "Mul", ["input", "scale"], ["shared"]),
+                self._node("left", "Add", ["shared", "bias"], ["left_out"]),
+                self._node("right", "Add", ["shared", "bias"], ["right_out"]),
+                self._node("output", "Add", ["left_out", "right_out"], ["result"]),
+            ],
+            input=[SimpleNamespace(name="input")],
+            output=[SimpleNamespace(name="result")],
+            initializer=[SimpleNamespace(name="scale"), SimpleNamespace(name="bias")],
+            value_info=[],
+        )
+
+        report = _prune_unreachable_nodes(graph)
+
+        self.assertEqual(report["removed_node_count"], 0)
+        self.assertEqual(len(graph.node), 4)
 
 
 if __name__ == "__main__":

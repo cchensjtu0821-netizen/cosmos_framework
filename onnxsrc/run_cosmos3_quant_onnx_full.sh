@@ -59,7 +59,7 @@ COSMOS3_PROMPT="${COSMOS3_PROMPT:-Pick up the object and place it in the target 
 COSMOS3_QUANT_BIT=8
 
 COSMOS3_RESULT_ROOT="${COSMOS3_RESULT_ROOT:-/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/quant}"
-COSMOS3_QUANT_ROOT="${COSMOS3_QUANT_ROOT:-${COSMOS3_RESULT_ROOT}/edge_policy_${COSMOS3_ACTION_CHUNK_SIZE}actions_int8_dyn_s8}"
+COSMOS3_QUANT_ROOT="${COSMOS3_QUANT_ROOT:-${COSMOS3_RESULT_ROOT}/edge_policy_${COSMOS3_ACTION_CHUNK_SIZE}actions_int8_static}"
 
 if [[ "${COSMOS3_CLEAN_OUTPUT}" == "1" && "${COSMOS3_START_STEP5}" != "1" ]]; then
     case "${COSMOS3_QUANT_ROOT}" in
@@ -69,8 +69,8 @@ if [[ "${COSMOS3_CLEAN_OUTPUT}" == "1" && "${COSMOS3_START_STEP5}" != "1" ]]; th
 fi
 mkdir -p "${COSMOS3_QUANT_ROOT}"
 
-COSMOS3_QUANT_CONFIG="${COSMOS3_QUANT_ROOT}/dopt_config_int8_dyn_s8.json"
-COSMOS3_QUANT_CONFIG_REPORT="${COSMOS3_QUANT_ROOT}/dopt_config_int8_dyn_s8.report.json"
+COSMOS3_QUANT_CONFIG="${COSMOS3_QUANT_ROOT}/dopt_config_int8_static.json"
+COSMOS3_QUANT_CONFIG_REPORT="${COSMOS3_QUANT_ROOT}/dopt_config_int8_static.report.json"
 COSMOS3_FAKEQUANT_WEIGHT="${COSMOS3_QUANT_ROOT}/fakequant_weight.pth"
 COSMOS3_QUANT_OUTPUT_DIR="${COSMOS3_QUANT_ROOT}/quant_params"
 COSMOS3_QUANT_PARAMS_FILE="${COSMOS3_QUANT_PARAMS_FILE:-${COSMOS3_QUANT_OUTPUT_DIR}_v2}"
@@ -119,7 +119,7 @@ if [[ "${COSMOS3_START_STEP5}" != "1" ]]; then
         --embedding-separate "${COSMOS3_EMBEDDING_SEPARATE}" \
         "${COMMON_ARGS[@]}"
 
-    echo "========== Step 2: select INT8 dyn_s8 Linear layers =========="
+    echo "========== Step 2: select static INT8 Linear layers =========="
     python3 "${COSMOS3_ONNX_SRC_DIR}/modify_dopt_config.py" \
         "${COSMOS3_QUANT_CONFIG}" \
         --bit "${COSMOS3_QUANT_BIT}" \

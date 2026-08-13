@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep quantized Policy Linear layers and configure INT8 weight + dyn_s8 input."""
+"""Keep quantized Policy Linear layers and configure static INT8 quantization."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def update_config(
     report_path: Path,
 ) -> None:
     if bit != 8:
-        raise ValueError("Cosmos3 dyn_s8 workflow currently supports only --bit 8")
+        raise ValueError("Cosmos3 static INT8 workflow currently supports only --bit 8")
     if not config_path.is_file():
         raise FileNotFoundError(f"DOPT config does not exist: {config_path}")
 
@@ -52,7 +52,8 @@ def update_config(
         },
         "input": {
             "bit": 8,
-            "input_algo": "dyn_s8",
+            "per_channel": False,
+            "input_algo": "min_max",
         },
     }
 
@@ -81,7 +82,10 @@ def update_config(
     report = {
         "config_path": str(config_path.resolve()),
         "backup_path": str(backup_path.resolve()),
-        "policy": "reachable Policy torch.nn.Linear only: signed INT8 per-channel weight + dyn_s8 input",
+        "policy": (
+            "reachable Policy torch.nn.Linear only: signed INT8 per-channel weight "
+            "+ static per-tensor min_max input"
+        ),
         "bit": bit,
         "default_exclude_regexes": DEFAULT_EXCLUDE_REGEXES,
         "user_exclude_regexes": exclude_regexes,

@@ -9,7 +9,7 @@ sampler, CFG loop, or action postprocessing.
 ## Pipeline
 
 1. `cosmos3_quantize.py --stage gen-config` creates the DOPT configuration.
-2. `modify_dopt_config.py` selects 8-bit weight + `dyn_s8` input quantization
+2. `modify_dopt_config.py` selects static 8-bit weight + input quantization
    for Policy `torch.nn.Linear` layers and removes non-quantized entries from
    the deployment config.
 3. `cosmos3_quantize.py --stage quant` prepares the fixed Policy denoiser with
@@ -53,7 +53,10 @@ sampler, CFG loop, or action postprocessing.
    contiguous `ScatterND(reduction=add)` patterns to `Slice`/`Add`/`Concat`.
    It also lowers default-overwrite `ScatterND` with static, sorted, unique
    `[N, 1]` row indices to interleaved data/update `Slice` nodes and bounded
-   fan-in `Concat` nodes. The report lists every remaining `ScatterND` so later
+   fan-in `Concat` nodes. After these lowerings it removes graph-unreachable
+   nodes, including dead index Casts whose GatherND/ScatterND consumers were
+   replaced, without folding live Casts or renaming live compute nodes. The
+   report lists every remaining `ScatterND` so later
    OMG failures can be correlated without assuming all ScatterND layouts are
    interchangeable.
    It also rejects node tensors or graph I/O whose rank exceeds 4. Findings are
@@ -83,14 +86,14 @@ continue.
 The DOPT simulator is a private server dependency. These scripts intentionally
 import it only after adding `COSMOS3_DOPT_SIM_PATH` to `sys.path`.
 
-## Dynamic Linear policy
+## Static Linear policy
 
 The default modifier selects every config entry whose type contains
 `torch.nn.modules.linear`, except `language_model.lm_head`, which is not
 executed by the exported vision/action denoiser boundary:
 
 - weight: signed INT8, per-channel, `min_max`;
-- input: INT8 dynamic activation, `dyn_s8`;
+- input: static INT8 activation, per-tensor, `min_max`;
 - all non-quantized entries are omitted from the final DOPT config.
 
 Use repeatable `--exclude-regex` arguments for backend-sensitive Linear

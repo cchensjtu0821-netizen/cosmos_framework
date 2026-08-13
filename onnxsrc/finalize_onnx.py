@@ -99,6 +99,97 @@ def _eliminate_graph_output_identities(graph) -> list[dict[str, object]]:
     return eliminated
 
 
+def _prune_unreachable_nodes(graph) -> dict[str, object]:
+    """Remove nodes and metadata that cannot reach a graph output.
+
+    Compatibility lowering can replace GatherND/ScatterND consumers while
+    leaving their index-normalization Cast nodes behind.  Prune only by graph
+    reachability after every lowering has finished; do not perform algebraic
+    Cast folding or rename any live node.
+    """
+
+    subgraph_nodes = []
+    for node in graph.node:
+        if any(
+            (hasattr(attribute, "HasField") and attribute.HasField("g"))
+            or bool(getattr(attribute, "graphs", ()))
+            for attribute in getattr(node, "attribute", ())
+        ):
+            subgraph_nodes.append(node.name)
+    if subgraph_nodes:
+        return {
+            "skipped": True,
+            "reason": "graph contains control-flow subgraphs with possible outer-scope captures",
+            "subgraph_nodes": subgraph_nodes,
+            "node_count_before": len(graph.node),
+            "node_count_after": len(graph.node),
+            "removed_node_count": 0,
+            "removed_node_op_counts": {},
+            "removed_nodes": [],
+            "removed_initializer_count": 0,
+            "removed_value_info_count": 0,
+        }
+
+    producer_indices = {
+        output_name: index
+        for index, node in enumerate(graph.node)
+        for output_name in node.output
+        if output_name
+    }
+    required_tensors = {output.name for output in graph.output}
+    required_nodes: set[int] = set()
+    stack = list(required_tensors)
+    while stack:
+        tensor_name = stack.pop()
+        node_index = producer_indices.get(tensor_name)
+        if node_index is None or node_index in required_nodes:
+            continue
+        required_nodes.add(node_index)
+        for input_name in graph.node[node_index].input:
+            if input_name and input_name not in required_tensors:
+                required_tensors.add(input_name)
+                stack.append(input_name)
+
+    nodes_before = list(graph.node)
+    removed_nodes = [
+        {
+            "index": index,
+            "name": node.name or f"<{node.op_type}:{index}>",
+            "op_type": node.op_type,
+            "outputs": list(node.output),
+        }
+        for index, node in enumerate(nodes_before)
+        if index not in required_nodes
+    ]
+    removed_node_op_counts = Counter(item["op_type"] for item in removed_nodes)
+    kept_nodes = [node for index, node in enumerate(nodes_before) if index in required_nodes]
+    del graph.node[:]
+    graph.node.extend(kept_nodes)
+
+    initializers_before = len(graph.initializer)
+    kept_initializers = [tensor for tensor in graph.initializer if tensor.name in required_tensors]
+    del graph.initializer[:]
+    graph.initializer.extend(kept_initializers)
+
+    value_info_before = len(graph.value_info)
+    kept_value_info = [value for value in graph.value_info if value.name in required_tensors]
+    del graph.value_info[:]
+    graph.value_info.extend(kept_value_info)
+
+    return {
+        "skipped": False,
+        "reason": None,
+        "subgraph_nodes": [],
+        "node_count_before": len(nodes_before),
+        "node_count_after": len(kept_nodes),
+        "removed_node_count": len(removed_nodes),
+        "removed_node_op_counts": dict(sorted(removed_node_op_counts.items())),
+        "removed_nodes": removed_nodes,
+        "removed_initializer_count": initializers_before - len(kept_initializers),
+        "removed_value_info_count": value_info_before - len(kept_value_info),
+    }
+
+
 def _constant_resolver(graph, onnx):
     import numpy as np
 
@@ -854,6 +945,16 @@ def main() -> None:
         unresolved_scatter_nd_reduction,
         remaining_scatter_nd,
     ) = _normalize_scatter_nd_for_omg(model.graph, resolve, onnx)
+    unreachable_prune = _prune_unreachable_nodes(model.graph)
+    live_node_names = {node.name for node in model.graph.node}
+    unresolved_gather_nd = [name for name in unresolved_gather_nd if name in live_node_names]
+    unresolved_scatter_nd_reduction = [
+        name for name in unresolved_scatter_nd_reduction if name in live_node_names
+    ]
+    live_scatter_nd_names = {node.name for node in model.graph.node if node.op_type == "ScatterND"}
+    remaining_scatter_nd = [
+        item for item in remaining_scatter_nd if item["name"] in live_scatter_nd_names
+    ]
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     producers = {
         output_name: node
@@ -932,6 +1033,9 @@ def main() -> None:
         "duplicate_names_after": duplicates,
         "eliminated_graph_output_identity_count": len(eliminated_graph_output_identities),
         "eliminated_graph_output_identities": eliminated_graph_output_identities,
+        "unreachable_prune": unreachable_prune,
+        "removed_unreachable_node_count": unreachable_prune["removed_node_count"],
+        "removed_unreachable_node_op_counts": unreachable_prune["removed_node_op_counts"],
         "normalized_reshape_allowzero_count": normalized_reshape_allowzero,
         "unresolved_reshape_allowzero": unresolved_reshape_allowzero,
         "materialize_static_mul_broadcasts_enabled": args.materialize_static_mul_broadcasts,
