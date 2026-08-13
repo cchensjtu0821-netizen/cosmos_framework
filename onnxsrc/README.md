@@ -64,7 +64,11 @@ sampler, CFG loop, or action postprocessing.
    missing shape metadata, graph I/O, and operator counts.
 9. After the strict audit passes, `run_cosmos3_quant_onnx_full.sh` invokes OMG
    to convert the named ONNX and its external weight data to OMC. Set
-   `COSMOS3_RUN_OMG=0` to stop after ONNX generation and audit.
+   `COSMOS3_RUN_OMG=0` to stop after ONNX generation and audit. OMG stdout and
+   stderr remain visible in the terminal and are also saved to
+   `${COSMOS3_QUANT_ROOT}/omg.log`; override `COSMOS3_OMG_LOG` to select another
+   path. The pipeline retains OMG's nonzero exit status when logging through
+   `tee`.
 
 All paths are supplied through environment variables in
 `run_cosmos3_quant_onnx_full.sh`. Copy that file or override its variables;

@@ -89,6 +89,7 @@ COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
 COSMOS3_MATCH_REPORT="${COSMOS3_QUANT_ROOT}/quant_onnx_name_match.json"
 COSMOS3_AUDIT_REPORT="${COSMOS3_QUANT_ROOT}/onnx_audit.json"
 COSMOS3_OMC_OUTPUT="${COSMOS3_OMC_OUTPUT:-${COSMOS3_QUANT_ROOT}/world}"
+COSMOS3_OMG_LOG="${COSMOS3_OMG_LOG:-${COSMOS3_QUANT_ROOT}/omg.log}"
 
 COMMON_ARGS=(
     --checkpoint-path "${COSMOS3_CHECKPOINT_PATH}"
@@ -206,6 +207,8 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         echo "ONNX external weight file not found: ${COSMOS3_ONNX_WEIGHT}" >&2
         exit 1
     fi
+    mkdir -p -- "$(dirname -- "${COSMOS3_OMG_LOG}")"
+    echo "OMG log: ${COSMOS3_OMG_LOG}"
     "${COSMOS3_OMG_BIN}" \
         --model="${COSMOS3_ONNX_FINAL}" \
         --framework=5 \
@@ -216,7 +219,8 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         --input_shape="${COSMOS3_OMG_INPUT_SHAPE}" \
         --input_type="video_latent:FP16;action_latent:FP16;vision_timestep:FP16;action_timestep:FP16;prompt_embeddings:FP16" \
         --output_type="vision_velocity:FP16;action_velocity:FP16" \
-        --save_weights_as_external_data=true
+        --save_weights_as_external_data=true \
+        2>&1 | tee -- "${COSMOS3_OMG_LOG}"
 fi
 
 echo "========== Step 10: remove reproducible intermediate files =========="
@@ -239,4 +243,5 @@ echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"
 if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
     echo "OMC output prefix: ${COSMOS3_OMC_OUTPUT}"
+    echo "OMG log: ${COSMOS3_OMG_LOG}"
 fi
