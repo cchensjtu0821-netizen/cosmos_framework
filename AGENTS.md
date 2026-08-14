@@ -12,6 +12,19 @@ This file applies to work under `cosmos_framework/`. Read the repository-root
   descriptive commit message.
 - When the user asks to publish directly, update `main`, push `origin/main`,
   and remove any temporary branch created for that change.
+- This repository's `origin` uses Git over SSH. Direct commits and pushes to
+  `origin/main` do not require GitHub CLI authentication, a pull request, or a
+  `gh auth status` prerequisite. Do not block a direct publish because a
+  cached GitHub API token is absent or stale; attempt the requested Git SSH
+  operation and ask about authentication only if that operation itself reports
+  an SSH/permission failure. Use `gh` authentication only for workflows that
+  actually need the GitHub API, such as creating or editing a pull request.
+- For a direct publish from the mixed worktree: fetch `origin/main`; confirm
+  local `main` is current; stage only explicit requested paths; inspect
+  `git diff --cached` and run relevant checks; commit tersely; run
+  `git push origin main`; then verify the remote SHA with
+  `git ls-remote origin refs/heads/main`. Preserve all unrelated staged,
+  unstaged, and untracked files throughout.
 - Do not commit generated ONNX models, external weight files, profiling output,
   caches, credentials, tokens, or machine-specific artifacts unless explicitly
   requested.
