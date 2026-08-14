@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from cosmos_framework.onnxsrc.rewrite_omg_unsupported_patterns import (
+    _build_argument_parser,
     _depth_to_space_target,
     _space_to_depth_output_channel,
 )
@@ -75,6 +76,35 @@ class SpatialChannelMappingTest(unittest.TestCase):
     def test_rejects_unknown_depth_to_space_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported DepthToSpace mode"):
             _depth_to_space_target(0, 3, 2, "UNKNOWN")
+
+
+class ProfilingOnlySwitchTest(unittest.TestCase):
+    def test_dynamic_trig_bypass_is_disabled_by_default(self) -> None:
+        args = _build_argument_parser().parse_args(
+            [
+                "--input",
+                "input.onnx",
+                "--output",
+                "output.onnx",
+                "--report",
+                "report.json",
+            ]
+        )
+        self.assertFalse(args.bypass_dynamic_trig_for_profiling)
+
+    def test_dynamic_trig_bypass_requires_explicit_switch(self) -> None:
+        args = _build_argument_parser().parse_args(
+            [
+                "--input",
+                "input.onnx",
+                "--output",
+                "output.onnx",
+                "--report",
+                "report.json",
+                "--bypass-dynamic-trig-for-profiling",
+            ]
+        )
+        self.assertTrue(args.bypass_dynamic_trig_for_profiling)
 
 
 if __name__ == "__main__":

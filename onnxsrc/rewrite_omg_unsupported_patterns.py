@@ -4,8 +4,9 @@
 The input and output models must share a directory so existing external-data
 references remain valid.  Large external model weights are never loaded or
 rewritten; newly materialized constants and one-hot convolution weights remain
-inline in the output ONNX file. Runtime-dependent Sin/Cos nodes are reported
-but intentionally retained because deleting them is not value-preserving.
+inline in the output ONNX file. Runtime-dependent Sin/Cos nodes are retained by
+default. An explicit profiling-only switch can bypass them when numerical
+equivalence is not required.
 """
 
 from __future__ import annotations
@@ -343,6 +344,7 @@ def rewrite(
     *,
     max_concat_copies: int,
     overwrite: bool,
+    bypass_dynamic_trig_for_profiling: bool = False,
 ) -> dict[str, Any]:
     if input_path.parent.resolve() != output_path.parent.resolve():
         raise ValueError("Input and output must share a directory for external-data references")
@@ -367,6 +369,9 @@ def rewrite(
 
     constant_trig_reports = [
         item for item in analysis["sin_cos"] if item["constant_fold_candidate"]
+    ]
+    dynamic_trig_reports = [
+        item for item in analysis["sin_cos"] if not item["constant_fold_candidate"]
     ]
     constant_trig_outputs = [item["output"] for item in constant_trig_reports]
     constant_trig_values = _evaluate_constant_outputs(model, constant_trig_outputs, onnx)
@@ -477,6 +482,48 @@ def rewrite(
             }
         )
 
+    if bypass_dynamic_trig_for_profiling:
+        graph_outputs = {output.name for output in graph.output}
+        for item in dynamic_trig_reports:
+            node = nodes_by_name[item["name"]]
+            if item["input_shape"] != item["output_shape"]:
+                raise ValueError(
+                    f"Profiling-only bypass requires equal input/output shapes: {item}"
+                )
+            if len(node.input) != 1 or len(node.output) != 1:
+                raise ValueError(
+                    f"Profiling-only bypass requires one input and output: {node.name!r}"
+                )
+            node_name = node.name
+            op_type = node.op_type
+            input_name = node.input[0]
+            output_name = node.output[0]
+            if output_name in graph_outputs:
+                raise ValueError(
+                    f"Refusing to bypass graph-output trigonometric node {node_name!r}"
+                )
+            consumer_names: list[str] = []
+            for consumer in graph.node:
+                replaced = False
+                for input_index, consumer_input in enumerate(consumer.input):
+                    if consumer_input == output_name:
+                        consumer.input[input_index] = input_name
+                        replaced = True
+                if replaced:
+                    consumer_names.append(consumer.name)
+            graph.node.remove(node)
+            changes.append(
+                {
+                    "node": node_name,
+                    "rewrite": f"profiling-only {op_type}->input bypass",
+                    "input": input_name,
+                    "output": output_name,
+                    "shape": item["output_shape"],
+                    "consumers": consumer_names,
+                    "numerically_equivalent": False,
+                }
+            )
+
     for item in analysis["space_to_depth"]:
         node = nodes_by_name[item["name"]]
         input_name = node.input[0]
@@ -580,20 +627,41 @@ def rewrite(
         "remaining_dynamic_trig_count": sum(
             int(item["op_type"] in {"Sin", "Cos"}) for item in remaining
         ),
-        "numerical_equivalence_required": True,
+        "profiling_only_dynamic_trig_bypass": bypass_dynamic_trig_for_profiling,
+        "semantic_equivalence_expected": not bypass_dynamic_trig_for_profiling,
+        "numerical_equivalence_required": not bypass_dynamic_trig_for_profiling,
+        "profiling_only_warning": (
+            "Dynamic timestep Sin/Cos outputs were replaced by their inputs. "
+            "This model is only for structural performance/power evaluation."
+            if bypass_dynamic_trig_for_profiling
+            else None
+        ),
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     return report
 
 
-def main() -> None:
+def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--max-concat-copies", type=int, default=8)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--bypass-dynamic-trig-for-profiling",
+        action="store_true",
+        help=(
+            "NON-EQUIVALENT: replace runtime-dependent Sin/Cos outputs with "
+            "their inputs for performance/power evaluation only"
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    parser = _build_argument_parser()
     args = parser.parse_args()
     if not args.input.is_file():
         parser.error(f"Input ONNX does not exist: {args.input}")
@@ -603,12 +671,16 @@ def main() -> None:
         args.report,
         max_concat_copies=args.max_concat_copies,
         overwrite=args.overwrite,
+        bypass_dynamic_trig_for_profiling=args.bypass_dynamic_trig_for_profiling,
     )
     print(
         f"nodes={result['node_count_before']}->{result['node_count_after']} "
         f"changes={result['change_count']} "
-        f"remaining_dynamic_trig={result['remaining_dynamic_trig_count']}"
+        f"remaining_dynamic_trig={result['remaining_dynamic_trig_count']} "
+        f"profiling_only={str(result['profiling_only_dynamic_trig_bypass']).lower()}"
     )
+    if result["profiling_only_dynamic_trig_bypass"]:
+        print(f"WARNING: {result['profiling_only_warning']}")
     print(f"Output: {args.output.resolve()}")
     print(f"Report: {args.report.resolve()}")
 
