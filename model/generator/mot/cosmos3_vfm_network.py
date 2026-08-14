@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import copy
 import math
 from typing import List, Tuple
 
@@ -215,6 +216,58 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             torch.nn.init.trunc_normal_(self.sound_modality_embed, std=std, a=-3 * std, b=3 * std)
 
         self.language_model.init_weights(buffer_device=buffer_device)
+
+    def separate_timestep_embedders_for_onnx(self) -> tuple[str, ...]:
+        """Clone the shared timestep MLP once per generated modality.
+
+        Released checkpoints contain one ``time_embedder`` whose two Linear
+        layers are called independently by the vision and action paths.  That
+        parameter sharing is valid in eager PyTorch, but it makes four exported
+        Gemm/MatMul executions refer to only two weight tensors and two DOPT
+        layer entries.  The restricted deployment backend requires each static
+        linear execution to own a distinct weight tensor and quantization entry.
+
+        This method is intentionally called only after checkpoint loading by
+        the ONNX/DOPT preparation paths.  It deep-copies the loaded values into
+        independent modules and removes the shared module, so normal checkpoint
+        keys and ordinary training/inference remain backward compatible.
+        """
+        if not hasattr(self, "time_embedder"):
+            separated = tuple(
+                name
+                for name in ("vision_time_embedder", "action_time_embedder", "sound_time_embedder")
+                if hasattr(self, name)
+            )
+            if separated:
+                return separated
+            raise RuntimeError("Cosmos3VFMNetwork has no timestep embedder to separate")
+
+        shared_time_embedder = self.time_embedder
+        separated: list[str] = []
+        for modality, enabled in (
+            ("vision", self.config.vision_gen),
+            ("action", self.config.action_gen),
+            ("sound", self.config.sound_gen),
+        ):
+            if not enabled:
+                continue
+            name = f"{modality}_time_embedder"
+            setattr(self, name, copy.deepcopy(shared_time_embedder))
+            separated.append(name)
+
+        del self.time_embedder
+        if not separated:
+            raise RuntimeError("No generated modality is enabled for timestep embedding")
+        return tuple(separated)
+
+    def _timestep_embedder_for(self, modality: str) -> TimestepEmbedder:
+        separated = getattr(self, f"{modality}_time_embedder", None)
+        if separated is not None:
+            return separated
+        shared = getattr(self, "time_embedder", None)
+        if shared is None:
+            raise RuntimeError(f"No timestep embedder is available for modality {modality!r}")
+        return shared
 
     def generate_reasoner_text(
         self,
@@ -553,18 +606,23 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         )
         return packed_sequence, packed_text_embedding.dtype
 
-    def _embed_packed_timesteps(self, timesteps: torch.Tensor, packed_seq: PackedSequence) -> torch.Tensor:
+    def _embed_packed_timesteps(
+        self,
+        timesteps: torch.Tensor,
+        packed_seq: PackedSequence,
+        time_embedder: TimestepEmbedder,
+    ) -> torch.Tensor:
         """Embed noised-token timesteps, reusing work when packing proves they share one scalar."""
         if packed_seq.uses_single_timestep and timesteps.numel() > 1:
             timestep = timesteps[:1]  # [1]
             with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-                timestep_embed = self.time_embedder(timestep)  # [1,hidden_size]
+                timestep_embed = time_embedder(timestep)  # [1,hidden_size]
             # Materialize: expand() aliases storage; in-place ops on a float32 no-op .to() would corrupt all rows.
             return timestep_embed.expand(timesteps.shape[0], -1).contiguous()  # [N_noisy_frames,hidden_size]
 
         # Timesteps are computed in FP32 for numerical stability.
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            return self.time_embedder(timesteps)  # [N_noisy_frames,hidden_size]
+            return time_embedder(timesteps)  # [N_noisy_frames,hidden_size]
 
     def _encode_vision(
         self,
@@ -609,7 +667,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             timesteps_vision = vision.timesteps.to(dtype=torch.float32) * self.timestep_scale  # [N_noisy_frames_vision]
 
             packed_timestep_embeds_vision = self._embed_packed_timesteps(
-                timesteps_vision, packed_seq
+                timesteps_vision,
+                packed_seq,
+                self._timestep_embedder_for("vision"),
             )  # [N_noisy_frames_vision,hidden_size]
             packed_timestep_embeds_vision = packed_timestep_embeds_vision.to(
                 target_dtype
@@ -719,7 +779,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if has_noisy_actions:
             timesteps_action = action.timesteps * self.timestep_scale  # [N_noisy_frames_action]
             packed_timestep_embeds_action = self._embed_packed_timesteps(
-                timesteps_action, packed_seq
+                timesteps_action,
+                packed_seq,
+                self._timestep_embedder_for("action"),
             )  # [N_noisy_frames_action,hidden_size]
             packed_timestep_embeds_action = packed_timestep_embeds_action.to(
                 target_dtype
@@ -830,7 +892,9 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         if has_noisy_sound:
             timesteps_sound = sound.timesteps * self.timestep_scale  # [N_noisy_frames_sound]
             packed_timestep_embeds_sound = self._embed_packed_timesteps(
-                timesteps_sound, packed_seq
+                timesteps_sound,
+                packed_seq,
+                self._timestep_embedder_for("sound"),
             )  # [N_noisy_frames_sound,hidden_size]
             packed_timestep_embeds_sound = packed_timestep_embeds_sound.to(
                 target_dtype

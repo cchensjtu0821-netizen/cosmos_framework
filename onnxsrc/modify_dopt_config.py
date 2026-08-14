@@ -12,6 +12,15 @@ from typing import Any
 
 
 DEFAULT_EXCLUDE_REGEXES = [r"^language_model\.lm_head$"]
+REQUIRED_TIMESTEP_LINEAR_LAYERS = frozenset(
+    {
+        "vision_time_embedder.mlp.0",
+        "vision_time_embedder.mlp.2",
+        "action_time_embedder.mlp.0",
+        "action_time_embedder.mlp.2",
+    }
+)
+LEGACY_SHARED_TIMESTEP_PREFIX = "time_embedder."
 
 
 def _matches_any(name: str, patterns: list[re.Pattern[str]]) -> bool:
@@ -36,6 +45,14 @@ def update_config(
     strategies = config.get("layer_strategy")
     if not isinstance(strategies, dict):
         raise ValueError("DOPT config has no object-valued 'layer_strategy'")
+    legacy_timestep_layers = sorted(name for name in strategies if name.startswith(LEGACY_SHARED_TIMESTEP_PREFIX))
+    missing_timestep_layers = sorted(REQUIRED_TIMESTEP_LINEAR_LAYERS - strategies.keys())
+    if legacy_timestep_layers or missing_timestep_layers:
+        raise ValueError(
+            "DOPT config was not generated from the ONNX-separated timestep modules; "
+            f"legacy_shared={legacy_timestep_layers}, missing={missing_timestep_layers}. "
+            "Rerun pipeline Step 1 with the current code before modifying or calibrating the config."
+        )
 
     effective_exclude_regexes = [*DEFAULT_EXCLUDE_REGEXES, *exclude_regexes]
     exclusions = [re.compile(expression) for expression in effective_exclude_regexes]
@@ -90,6 +107,7 @@ def update_config(
         "default_exclude_regexes": DEFAULT_EXCLUDE_REGEXES,
         "user_exclude_regexes": exclude_regexes,
         "effective_exclude_regexes": effective_exclude_regexes,
+        "required_timestep_linear_layers": sorted(REQUIRED_TIMESTEP_LINEAR_LAYERS),
         "input_layer_count": len(strategies),
         "output_layer_count": len(quantized_strategies),
         "removed_layer_count": len(strategies) - len(quantized_strategies),

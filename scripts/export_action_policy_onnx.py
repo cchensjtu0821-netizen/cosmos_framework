@@ -170,10 +170,75 @@ def _install_onnx_attention(net: torch.nn.Module) -> int:
     return replaced
 
 
+def _separate_timestep_embedders_for_onnx(net: torch.nn.Module) -> tuple[str, ...]:
+    separate = getattr(net, "separate_timestep_embedders_for_onnx", None)
+    if not callable(separate):
+        raise RuntimeError("Policy network cannot separate shared timestep weights for ONNX export")
+    separated = tuple(separate())
+    required = {"vision_time_embedder", "action_time_embedder"}
+    missing = required - set(separated)
+    if missing:
+        raise RuntimeError(f"Policy ONNX export is missing modality timestep embedders: {sorted(missing)}")
+    timestep_weights = [
+        getattr(net, module_name).mlp[index].weight
+        for module_name in ("vision_time_embedder", "action_time_embedder")
+        for index in (0, 2)
+    ]
+    if len({id(weight) for weight in timestep_weights}) != len(timestep_weights):
+        raise RuntimeError("Separated timestep Linear modules still share Parameter objects")
+    print(f"Separated timestep embedders for ONNX/DOPT: {', '.join(separated)}")
+    return separated
+
+
 def _shape_manifest(names: tuple[str, ...], tensors: tuple[torch.Tensor, ...]) -> dict[str, Any]:
     return {
         name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype), "device": str(tensor.device)}
         for name, tensor in zip(names, tensors)
+    }
+
+
+_TIMESTEP_LINEAR_WEIGHT_SUFFIXES = (
+    "vision_time_embedder.mlp.0.weight",
+    "vision_time_embedder.mlp.2.weight",
+    "action_time_embedder.mlp.0.weight",
+    "action_time_embedder.mlp.2.weight",
+)
+
+
+def _verify_separate_onnx_timestep_weights(model_path: Path, onnx: Any) -> dict[str, Any]:
+    """Require one distinct initializer for each exported timestep Linear."""
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    initializer_names = [initializer.name for initializer in model.graph.initializer]
+    resolved: dict[str, str] = {}
+    for suffix in _TIMESTEP_LINEAR_WEIGHT_SUFFIXES:
+        matches = [name for name in initializer_names if name.endswith(suffix)]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected exactly one ONNX initializer ending in {suffix!r}, found {matches}"
+            )
+        resolved[suffix] = matches[0]
+
+    if len(set(resolved.values())) != len(_TIMESTEP_LINEAR_WEIGHT_SUFFIXES):
+        raise RuntimeError(f"ONNX timestep Linear weights are still shared: {resolved}")
+
+    consumers: dict[str, list[str]] = {}
+    for suffix, initializer_name in resolved.items():
+        consumer_nodes = [
+            f"{node.name or '<unnamed>'}:{node.op_type}"
+            for node in model.graph.node
+            if initializer_name in node.input
+        ]
+        if len(consumer_nodes) != 1:
+            raise RuntimeError(
+                f"Expected timestep initializer {initializer_name!r} to have one direct consumer, "
+                f"found {consumer_nodes}"
+            )
+        consumers[suffix] = consumer_nodes
+
+    return {
+        "initializer_count": len(resolved),
+        "initializers": resolved,
+        "direct_consumers": consumers,
     }
 
 
@@ -248,6 +313,7 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
     sample = service._build_sample(_dummy_observation(args))
     data_batch = _build_data_batch_from_sample(sample)
     packed = _capture_first_packed_sequence(service, data_batch)
+    separated_time_embedders = _separate_timestep_embedders_for_onnx(service.model.net)
     replaced_attention_modules = _install_onnx_attention(service.model.net)
     print(f"Using ONNX dense attention in {replaced_attention_modules} module(s)")
 
@@ -285,6 +351,7 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
         "checkpoint_path": args.checkpoint_path,
         "inputs": _shape_manifest(input_names, inputs),
         "outputs": _shape_manifest(output_names, reference_outputs),
+        "separated_time_embedders": list(separated_time_embedders),
         "settings": {
             "prompt": args.prompt,
             "image_height": args.image_height,
@@ -309,6 +376,8 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
 
     if args.verify_onnx:
         onnx.checker.check_model(str(args.output_path))
+        timestep_weight_audit = _verify_separate_onnx_timestep_weights(args.output_path, onnx)
+        print(f"Verified separate ONNX timestep weights: {timestep_weight_audit['initializers']}")
         if args.export_dtype == "float32":
             dtype_counts = _verify_float32_onnx(args.output_path, onnx)
             print(f"Verified float32 ONNX initializers: forbidden dtype counts={dtype_counts}")
@@ -318,6 +387,8 @@ def export_action_policy_onnx(args: ExportArgs) -> None:
         simplified_path = _simplified_output_path(args)
         print(f"Simplifying ONNX to: {simplified_path}")
         _simplify_onnx(args.output_path, simplified_path)
+        timestep_weight_audit = _verify_separate_onnx_timestep_weights(simplified_path, onnx)
+        print(f"Verified simplified ONNX timestep weights: {timestep_weight_audit['initializers']}")
 
     print(f"ONNX saved to: {args.output_path}")
     if simplified_path is not None:

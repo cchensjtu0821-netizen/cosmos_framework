@@ -25,6 +25,18 @@ class UpdateConfigTest(unittest.TestCase):
                                 "quant_strategy": "legacy",
                                 "output": {"bit": 4},
                             },
+                            "vision_time_embedder.mlp.0": {
+                                "type": "torch.nn.modules.linear.Linear",
+                            },
+                            "vision_time_embedder.mlp.2": {
+                                "type": "torch.nn.modules.linear.Linear",
+                            },
+                            "action_time_embedder.mlp.0": {
+                                "type": "torch.nn.modules.linear.Linear",
+                            },
+                            "action_time_embedder.mlp.2": {
+                                "type": "torch.nn.modules.linear.Linear",
+                            },
                             "language_model.lm_head": {
                                 "type": "torch.nn.modules.linear.Linear",
                             },
@@ -43,7 +55,16 @@ class UpdateConfigTest(unittest.TestCase):
             )
 
             updated = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(list(updated["layer_strategy"]), ["language_model.layers.0.linear"])
+            self.assertEqual(
+                list(updated["layer_strategy"]),
+                [
+                    "language_model.layers.0.linear",
+                    "vision_time_embedder.mlp.0",
+                    "vision_time_embedder.mlp.2",
+                    "action_time_embedder.mlp.0",
+                    "action_time_embedder.mlp.2",
+                ],
+            )
             selected = updated["layer_strategy"]["language_model.layers.0.linear"]
             self.assertEqual(
                 selected["weight"],
@@ -62,9 +83,33 @@ class UpdateConfigTest(unittest.TestCase):
 
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertIn("static per-tensor min_max input", report["policy"])
-            self.assertEqual(report["selected_linear_count"], 1)
+            self.assertEqual(report["selected_linear_count"], 5)
             self.assertEqual(report["excluded_linear_count"], 1)
             self.assertEqual(report["non_linear_count"], 1)
+
+    def test_rejects_legacy_shared_timestep_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_path = root / "dopt_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "layer_strategy": {
+                            "time_embedder.mlp.0": {"type": "torch.nn.modules.linear.Linear"},
+                            "time_embedder.mlp.2": {"type": "torch.nn.modules.linear.Linear"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Rerun pipeline Step 1"):
+                update_config(
+                    config_path,
+                    bit=8,
+                    exclude_regexes=[],
+                    report_path=root / "report.json",
+                )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from cosmos_framework.scripts.export_action_policy_onnx import (
     PolicyDenoiserOnnxWrapper,
     _install_onnx_attention,
     _shape_manifest,
+    _verify_separate_onnx_timestep_weights,
     _verify_float32_onnx,
 )
 
@@ -363,6 +364,7 @@ def main() -> None:
     if args.external_data_mode == "single":
         external_data_path = requested_external_data_path
     onnx.checker.check_model(str(args.output))
+    timestep_weight_audit = _verify_separate_onnx_timestep_weights(args.output, onnx)
     forbidden_float_initializer_counts = _verify_float32_onnx(args.output, onnx)
     graph_io_dtype_counts = _verify_fp32_graph_io(args.output, onnx)
     embedded_quantization_counts = _verify_no_embedded_quantization(args.output, onnx)
@@ -370,6 +372,7 @@ def main() -> None:
         "Verified clean FP32 ONNX initializers: "
         f"forbidden dtype counts={forbidden_float_initializer_counts}"
     )
+    print(f"Verified separate ONNX timestep weights: {timestep_weight_audit['initializers']}")
     print(f"Verified clean ONNX graph I/O dtypes: {graph_io_dtype_counts}")
     print(f"Verified no embedded quantization nodes: {embedded_quantization_counts}")
     manifest = {
@@ -388,6 +391,7 @@ def main() -> None:
         "forbidden_float_initializer_counts": forbidden_float_initializer_counts,
         "graph_io_dtype_counts": graph_io_dtype_counts,
         "embedded_quantization_counts": embedded_quantization_counts,
+        "timestep_weight_audit": timestep_weight_audit,
     }
     manifest_path = args.output.with_suffix(args.output.suffix + ".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")

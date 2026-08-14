@@ -8,7 +8,11 @@ sampler, CFG loop, or action postprocessing.
 
 ## Pipeline
 
-1. `cosmos3_quantize.py --stage gen-config` creates the DOPT configuration.
+1. `cosmos3_quantize.py --stage gen-config` loads the checkpoint, clones the
+   shared two-Linear timestep MLP into independent
+   `vision_time_embedder`/`action_time_embedder` modules, then creates the DOPT
+   configuration. The clones start with identical values but own distinct
+   Parameters, ONNX initializers, and quantization entries.
 2. `modify_dopt_config.py` selects static 8-bit weight + input quantization
    for Policy `torch.nn.Linear` layers and removes non-quantized entries from
    the deployment config.
@@ -70,7 +74,10 @@ sampler, CFG loop, or action postprocessing.
    It also rejects node tensors or graph I/O whose rank exceeds 4. Findings are
    reported but high-rank nodes are never deleted merely to pass the audit.
 7. `match_quant_params.py` compares quant-file entry names with final ONNX
-   node names.
+   node names and requires all four modality-specific timestep Linear names in
+   both artifacts. This deliberately rejects a Step-5 resume from a legacy
+   shared-weight ONNX/quant-file pair even when its older 340 names match each
+   other.
 8. `audit_onnx.py` checks ONNX validity, duplicate/empty names, rank limits,
    missing shape metadata, graph I/O, and operator counts.
 9. After the strict audit passes, `run_cosmos3_quant_onnx_full.sh` invokes OMG
@@ -111,6 +118,30 @@ executed by the exported vision/action denoiser boundary:
 - weight: signed INT8, per-channel, `min_max`;
 - input: static INT8 activation, per-tensor, `min_max`;
 - all non-quantized entries are omitted from the final DOPT config.
+
+For the current Edge Policy graph, the two timestep Linear layers execute once
+for vision and once for action. The ONNX/DOPT preparation path therefore
+replaces the checkpoint's two shared `time_embedder.mlp.{0,2}` parameter sets
+with four independent entries:
+
+```text
+vision_time_embedder.mlp.0
+vision_time_embedder.mlp.2
+action_time_embedder.mlp.0
+action_time_embedder.mlp.2
+```
+
+The clean exporter audits the raw/simplified graph and fails unless all four
+weight initializers remain distinct. For the recorded Edge layout this closes
+the historical gap between 342 exported Linear executions and 340 selected
+parameter sets; a fresh DOPT configuration is expected to select 342 Linear
+entries. Reusing an older two-entry timestep quant file with the new graph is
+not supported.
+
+Because the module split happens immediately after checkpoint loading, the
+first run after this change must start at Step 1. `COSMOS3_START_STEP5=1`
+cannot retrofit separate weights or quantization entries into an existing raw
+ONNX and will fail the required-name check for legacy artifacts.
 
 Use repeatable `--exclude-regex` arguments for backend-sensitive Linear
 modules. The generated JSON report records every selected and excluded layer.

@@ -19,6 +19,7 @@ from cosmos_framework.scripts.export_action_policy_onnx import (
     PolicyDenoiserOnnxWrapper,
     _example_inputs,
     _install_onnx_attention,
+    _separate_timestep_embedders_for_onnx,
 )
 
 
@@ -97,6 +98,7 @@ def _load_fixed_policy(args: argparse.Namespace) -> tuple[RobolabPolicyService, 
         use_torch_compile=False,
     )
     service = RobolabPolicyService(server_args)
+    _separate_timestep_embedders_for_onnx(service.model.net)
     shapes = _manifest_input_shapes(args.layout_manifest)
     device = service.model.tensor_kwargs["device"]
     video_latent = torch.zeros(shapes["video_latent"], dtype=torch.float32, device=device)

@@ -211,7 +211,11 @@ fi
 python3 "${COSMOS3_ONNX_SRC_DIR}/match_quant_params.py" \
     --onnx "${COSMOS3_ONNX_FINAL}" \
     --quant-params "${COSMOS3_QUANT_PARAMS_FILE}" \
-    --output-json "${COSMOS3_MATCH_REPORT}"
+    --output-json "${COSMOS3_MATCH_REPORT}" \
+    --require-name vision_time_embedder.mlp.0 \
+    --require-name vision_time_embedder.mlp.2 \
+    --require-name action_time_embedder.mlp.0 \
+    --require-name action_time_embedder.mlp.2
 
 echo "========== Step 8: strict final ONNX audit =========="
 python3 "${COSMOS3_ONNX_SRC_DIR}/audit_onnx.py" \
