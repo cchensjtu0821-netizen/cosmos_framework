@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -336,8 +338,10 @@ def _decompose_gemm_nodes(
     graph: Any,
     onnx: Any,
     changes: list[dict[str, Any]],
+    materialized_transposed_weights: set[str] | None = None,
 ) -> int:
     """Decompose default-scale Gemm into Transpose/MatMul and optional Add."""
+    materialized_transposed_weights = materialized_transposed_weights or set()
     rewritten_nodes: list[Any] = []
     count = 0
     for node in graph.node:
@@ -380,7 +384,8 @@ def _decompose_gemm_nodes(
             rewritten_nodes.append(transpose_a)
             left = transposed_left
             inserted_transposes.append("A")
-        if trans_b:
+        materialized_weight = trans_b and right in materialized_transposed_weights
+        if trans_b and not materialized_weight:
             transposed_right = _unique_name(graph, f"{node.output[0]}_gemm_transpose_b")
             transpose_b = onnx.helper.make_node(
                 "Transpose",
@@ -422,6 +427,7 @@ def _decompose_gemm_nodes(
                 "rewrite": "Gemm->MatMul" + ("+Add" if has_bias else ""),
                 "has_bias": has_bias,
                 "transposed_inputs": inserted_transposes,
+                "materialized_transposed_weight": right if materialized_weight else None,
                 "alpha": alpha,
                 "beta": beta if has_bias else None,
             }
@@ -431,6 +437,225 @@ def _decompose_gemm_nodes(
     del graph.node[:]
     graph.node.extend(rewritten_nodes)
     return count
+
+
+def _external_data_values(tensor: Any) -> dict[str, str]:
+    return {entry.key: entry.value for entry in tensor.external_data}
+
+
+def _set_external_data(
+    tensor: Any,
+    onnx: Any,
+    *,
+    location: str,
+    offset: int,
+    length: int,
+) -> None:
+    del tensor.external_data[:]
+    for key, value in (
+        ("location", location),
+        ("offset", str(offset)),
+        ("length", str(length)),
+    ):
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = value
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    if hasattr(tensor, "ClearField"):
+        tensor.ClearField("raw_data")
+
+
+def _materialize_gemm_weight_transposes(
+    input_path: Path,
+    model: Any,
+    output_external_data_path: Path,
+    onnx: Any,
+) -> tuple[set[str], dict[str, Any]]:
+    """Transpose Gemm B initializers inside a separate external-data copy.
+
+    The input model must keep its original weights for the Step-5 numerical
+    reference. The candidate therefore receives a distinct external-data file;
+    transposed tensors overwrite the same byte ranges in that copy because a
+    rank-2 transpose preserves byte length.
+    """
+    if output_external_data_path.parent.resolve() != input_path.parent.resolve():
+        raise ValueError(
+            "Transposed external data must be beside the ONNX model: "
+            f"model={input_path}, external_data={output_external_data_path}"
+        )
+
+    all_tensors = list(onnx.external_data_helper._get_all_tensors(model))
+    external_tensors = [
+        tensor
+        for tensor in all_tensors
+        if onnx.external_data_helper.uses_external_data(tensor)
+    ]
+    source_locations = {
+        values["location"]
+        for tensor in external_tensors
+        if "location" in (values := _external_data_values(tensor))
+    }
+    if len(source_locations) != 1:
+        raise ValueError(
+            "Physical Gemm weight transposition requires exactly one source external-data file; "
+            f"found {sorted(source_locations)}"
+        )
+    source_location = next(iter(source_locations))
+    source_external_data_path = (input_path.parent / source_location).resolve()
+    if not source_external_data_path.is_file():
+        raise FileNotFoundError(f"Source ONNX external data does not exist: {source_external_data_path}")
+    if source_external_data_path == output_external_data_path.resolve():
+        raise ValueError(
+            "Transposed external data must differ from the source so the original Gemm graph "
+            "remains valid for numerical comparison"
+        )
+
+    initializers = {initializer.name: initializer for initializer in model.graph.initializer}
+    consumers: dict[str, list[Any]] = {}
+    for node in model.graph.node:
+        for input_name in node.input:
+            if input_name:
+                consumers.setdefault(input_name, []).append(node)
+    weights: dict[str, Any] = {}
+    for node in model.graph.node:
+        if node.op_type != "Gemm" or len(node.input) < 2:
+            continue
+        if int(_attribute(node, "transA", onnx, 0)) != 0:
+            raise ValueError(
+                f"Cannot guarantee transpose-free Gemm decomposition for {node.name!r}: "
+                "transA=1 would require a runtime Transpose on the activation input"
+            )
+        if int(_attribute(node, "transB", onnx, 0)) != 1:
+            continue
+        weight_name = node.input[1]
+        weight = initializers.get(weight_name)
+        if weight is None:
+            raise ValueError(
+                f"Cannot physically transpose Gemm {node.name!r}: "
+                f"B input {weight_name!r} is not an initializer"
+            )
+        if len(weight.dims) != 2:
+            raise ValueError(
+                f"Cannot physically transpose Gemm {node.name!r}: "
+                f"weight {weight_name!r} has rank {len(weight.dims)}, expected 2"
+            )
+        incompatible_consumers = [
+            consumer.name or consumer.op_type
+            for consumer in consumers.get(weight_name, [])
+            if not (
+                consumer.op_type == "Gemm"
+                and len(consumer.input) >= 2
+                and consumer.input[1] == weight_name
+                and int(_attribute(consumer, "transB", onnx, 0)) == 1
+            )
+        ]
+        if incompatible_consumers:
+            raise ValueError(
+                f"Cannot physically transpose shared weight {weight_name!r}; "
+                f"incompatible consumers={incompatible_consumers}"
+            )
+        weights[weight_name] = weight
+
+    if not weights:
+        raise ValueError(
+            "Physical Gemm weight transposition was requested, but no "
+            "Gemm(transB=1) initializer weights were found"
+        )
+
+    external_ranges: list[tuple[int, int, str]] = []
+    for tensor in external_tensors:
+        metadata = _external_data_values(tensor)
+        if metadata.get("location") != source_location or "length" not in metadata:
+            continue
+        start = int(metadata.get("offset", "0"))
+        external_ranges.append((start, start + int(metadata["length"]), tensor.name))
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{output_external_data_path.name}.transpose-",
+        dir=output_external_data_path.parent,
+        delete=False,
+    ) as temporary_file:
+        temporary_external_data_path = Path(temporary_file.name)
+    try:
+        shutil.copyfile(source_external_data_path, temporary_external_data_path)
+        records: list[dict[str, Any]] = []
+        with temporary_external_data_path.open("r+b") as output_file:
+            for weight_name, weight in weights.items():
+                original_shape = tuple(int(dim) for dim in weight.dims)
+                value = np.asarray(
+                    onnx.numpy_helper.to_array(weight, base_dir=str(input_path.parent))
+                )
+                if tuple(value.shape) != original_shape:
+                    raise ValueError(
+                        f"Loaded weight shape mismatch for {weight_name!r}: "
+                        f"metadata={original_shape}, value={value.shape}"
+                    )
+                transposed = np.ascontiguousarray(value.T)
+                metadata = _external_data_values(weight)
+                if metadata.get("location") == source_location:
+                    offset = int(metadata.get("offset", "0"))
+                    declared_length = int(metadata.get("length", str(value.nbytes)))
+                    if declared_length != value.nbytes or transposed.nbytes != value.nbytes:
+                        raise ValueError(
+                            f"External-data byte length mismatch for {weight_name!r}: "
+                            f"declared={declared_length}, original={value.nbytes}, "
+                            f"transposed={transposed.nbytes}"
+                        )
+                    overlaps = [
+                        name
+                        for start, end, name in external_ranges
+                        if name != weight_name
+                        and offset < end
+                        and start < offset + declared_length
+                    ]
+                    if overlaps:
+                        raise ValueError(
+                            f"Cannot overwrite external range for {weight_name!r}; "
+                            f"it overlaps tensors={overlaps[:20]}"
+                        )
+                else:
+                    output_file.seek(0, os.SEEK_END)
+                    offset = output_file.tell()
+                output_file.seek(offset)
+                output_file.write(memoryview(transposed).cast("B"))
+                _set_external_data(
+                    weight,
+                    onnx,
+                    location=output_external_data_path.name,
+                    offset=offset,
+                    length=transposed.nbytes,
+                )
+                del weight.dims[:]
+                weight.dims.extend(int(dim) for dim in transposed.shape)
+                records.append(
+                    {
+                        "weight": weight_name,
+                        "original_shape": list(original_shape),
+                        "transposed_shape": list(transposed.shape),
+                        "offset": offset,
+                        "length": transposed.nbytes,
+                    }
+                )
+            output_file.flush()
+            os.fsync(output_file.fileno())
+
+        for tensor in external_tensors:
+            if tensor.name in weights:
+                continue
+            for entry in tensor.external_data:
+                if entry.key == "location":
+                    entry.value = output_external_data_path.name
+        temporary_external_data_path.replace(output_external_data_path)
+    finally:
+        temporary_external_data_path.unlink(missing_ok=True)
+
+    return set(weights), {
+        "enabled": True,
+        "source_external_data_path": str(source_external_data_path),
+        "output_external_data_path": str(output_external_data_path.resolve()),
+        "transposed_weight_count": len(weights),
+        "weights": records,
+    }
 
 
 def _rewrite_constant_of_shape(
@@ -1364,6 +1589,7 @@ def _apply_rewrites(
     onnx: Any,
     lower_vision_ranks: bool,
     decompose_gemm: bool = False,
+    materialized_transposed_weights: set[str] | None = None,
     keep_causal_where: bool = False,
     keep_scatter_elements: bool = False,
 ) -> tuple[dict[str, int], list[dict[str, Any]]]:
@@ -1396,7 +1622,16 @@ def _apply_rewrites(
         "causal_where": (
             0 if keep_causal_where else _rewrite_causal_where_additive(graph, evaluator, onnx, changes)
         ),
-        "gemm": _decompose_gemm_nodes(graph, onnx, changes) if decompose_gemm else 0,
+        "gemm": (
+            _decompose_gemm_nodes(
+                graph,
+                onnx,
+                changes,
+                materialized_transposed_weights=materialized_transposed_weights,
+            )
+            if decompose_gemm
+            else 0
+        ),
     }
     counts["nd_indices"] = _normalize_nd_indices(graph, onnx, changes)
     _prune_unused(graph)
@@ -1443,6 +1678,8 @@ def rewrite_model(
     keep_vision_ranks: bool = False,
     keep_scatter_elements: bool = False,
     decompose_gemm: bool = False,
+    materialize_gemm_weight_transposes: bool = False,
+    transposed_external_data_path: Path | None = None,
 ) -> dict[str, Any]:
     try:
         import onnx
@@ -1451,8 +1688,30 @@ def rewrite_model(
 
     if input_path.parent.resolve() != output_path.parent.resolve():
         raise ValueError("Input and output must share a directory so existing external-data references remain valid")
+    if materialize_gemm_weight_transposes and not decompose_gemm:
+        raise ValueError("Physical Gemm weight transposition requires decompose_gemm=True")
+    if materialize_gemm_weight_transposes and transposed_external_data_path is None:
+        raise ValueError(
+            "Physical Gemm weight transposition requires a distinct transposed_external_data_path"
+        )
+    if not materialize_gemm_weight_transposes and transposed_external_data_path is not None:
+        raise ValueError(
+            "transposed_external_data_path is only valid with materialize_gemm_weight_transposes=True"
+        )
     model = onnx.load_model(str(input_path), load_external_data=False)
     graph = model.graph
+    materialized_transposed_weights: set[str] = set()
+    materialized_weight_report: dict[str, Any] = {"enabled": False}
+    if materialize_gemm_weight_transposes:
+        assert transposed_external_data_path is not None
+        materialized_transposed_weights, materialized_weight_report = (
+            _materialize_gemm_weight_transposes(
+                input_path,
+                model,
+                transposed_external_data_path,
+                onnx,
+            )
+        )
     counts, changes = _apply_rewrites(
         input_path,
         graph,
@@ -1463,6 +1722,7 @@ def rewrite_model(
         keep_causal_where=keep_causal_where,
         keep_scatter_elements=keep_scatter_elements,
         decompose_gemm=decompose_gemm,
+        materialized_transposed_weights=materialized_transposed_weights,
     )
     onnx.save_model(model, str(output_path))
     _infer_shapes_in_place(output_path, onnx)
@@ -1515,6 +1775,8 @@ def rewrite_model(
         "diagnostic_keep_vision_ranks": keep_vision_ranks,
         "diagnostic_keep_scatter_elements": keep_scatter_elements,
         "decompose_gemm": decompose_gemm,
+        "materialize_gemm_weight_transposes": materialize_gemm_weight_transposes,
+        "materialized_gemm_weights": materialized_weight_report,
         "counts": counts,
         "remaining_target_nodes": remaining,
         "remaining_high_rank_nodes": remaining_high_rank_nodes,
@@ -1559,6 +1821,22 @@ def main() -> None:
         help="Rewrite default-scale Gemm as MatMul and add bias only when a third input exists.",
     )
     parser.add_argument(
+        "--materialize-gemm-weight-transposes",
+        action="store_true",
+        help=(
+            "Physically transpose transB=1 Gemm weight initializers in a separate "
+            "external-data file so the replacement MatMul has no weight Transpose node."
+        ),
+    )
+    parser.add_argument(
+        "--transposed-external-data-path",
+        type=Path,
+        help=(
+            "Distinct external-data output for physically transposed Gemm weights; "
+            "required with --materialize-gemm-weight-transposes."
+        ),
+    )
+    parser.add_argument(
         "--verification-provider",
         action="append",
         dest="verification_providers",
@@ -1595,25 +1873,42 @@ def main() -> None:
         parser.error(f"input model does not exist: {args.input_path}")
     if args.input_path.resolve() == args.output_path.resolve():
         parser.error("output_path must differ from input_path")
+    if args.materialize_gemm_weight_transposes and not args.decompose_gemm:
+        parser.error("--materialize-gemm-weight-transposes requires --decompose-gemm")
+    if args.materialize_gemm_weight_transposes and args.transposed_external_data_path is None:
+        parser.error(
+            "--materialize-gemm-weight-transposes requires --transposed-external-data-path"
+        )
+    if not args.materialize_gemm_weight_transposes and args.transposed_external_data_path is not None:
+        parser.error(
+            "--transposed-external-data-path requires --materialize-gemm-weight-transposes"
+        )
 
     prompt_embedding_table_path = args.prompt_embedding_table_path or args.output_path.with_suffix(
         args.output_path.suffix + ".prompt_embedding.npy"
     )
-    report = rewrite_model(
-        args.input_path,
-        args.output_path,
-        domain_id=args.domain_id,
-        prompt_embedding_table_path=prompt_embedding_table_path,
-        verify_equivalence=args.verify_equivalence,
-        verification_providers=args.verification_providers,
-        verification_seed=args.verification_seed,
-        verification_atol=args.verification_atol,
-        verification_rtol=args.verification_rtol,
-        keep_causal_where=args.keep_causal_where,
-        keep_vision_ranks=args.keep_vision_ranks,
-        keep_scatter_elements=args.keep_scatter_elements,
-        decompose_gemm=args.decompose_gemm,
-    )
+    try:
+        report = rewrite_model(
+            args.input_path,
+            args.output_path,
+            domain_id=args.domain_id,
+            prompt_embedding_table_path=prompt_embedding_table_path,
+            verify_equivalence=args.verify_equivalence,
+            verification_providers=args.verification_providers,
+            verification_seed=args.verification_seed,
+            verification_atol=args.verification_atol,
+            verification_rtol=args.verification_rtol,
+            keep_causal_where=args.keep_causal_where,
+            keep_vision_ranks=args.keep_vision_ranks,
+            keep_scatter_elements=args.keep_scatter_elements,
+            decompose_gemm=args.decompose_gemm,
+            materialize_gemm_weight_transposes=args.materialize_gemm_weight_transposes,
+            transposed_external_data_path=args.transposed_external_data_path,
+        )
+    except Exception:
+        if args.materialize_gemm_weight_transposes and args.transposed_external_data_path is not None:
+            args.transposed_external_data_path.unlink(missing_ok=True)
+        raise
     report_path = args.report_path or args.output_path.with_suffix(args.output_path.suffix + ".rewrite.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(f"Rewritten ONNX saved to: {args.output_path}")

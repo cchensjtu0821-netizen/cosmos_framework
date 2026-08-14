@@ -20,6 +20,7 @@ COSMOS3_RUN_OMG="${COSMOS3_RUN_OMG:-1}"  # ONNX 审计通过后默认继续转�
 COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用 raw ONNX，从 Step 5 继续到底
 COSMOS3_MATERIALIZE_MUL_BROADCASTS="${COSMOS3_MATERIALIZE_MUL_BROADCASTS:-0}"  # 默认保留历史隐式 Mul 广播
 COSMOS3_DECOMPOSE_GEMM="${COSMOS3_DECOMPOSE_GEMM:-0}"  # Step 5 可选 Gemm -> MatMul + optional Add
+COSMOS3_TRANSPOSE_GEMM_WEIGHTS="${COSMOS3_TRANSPOSE_GEMM_WEIGHTS:-0}"  # 物理转置权重，避免新增 Transpose 节点
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
@@ -28,6 +29,14 @@ case "${COSMOS3_EXTERNAL_DATA_USE_PB}" in
     1) COSMOS3_EXTERNAL_DATA_SUFFIX=".pb" ;;
     *) echo "COSMOS3_EXTERNAL_DATA_USE_PB must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" in
+    0|1) ;;
+    *) echo "COSMOS3_TRANSPOSE_GEMM_WEIGHTS must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" == "1" && "${COSMOS3_DECOMPOSE_GEMM}" != "1" ]]; then
+    echo "COSMOS3_TRANSPOSE_GEMM_WEIGHTS=1 requires COSMOS3_DECOMPOSE_GEMM=1" >&2
+    exit 2
+fi
 
 if [[ ! -d "${COSMOS3_REPO_DIR}" ]]; then
     echo "Cosmos3 repository directory not found: ${COSMOS3_REPO_DIR}" >&2
@@ -83,6 +92,10 @@ else
     COSMOS3_EXTERNAL_DATA_DEFAULT="${COSMOS3_ONNX_RAW}${COSMOS3_EXTERNAL_DATA_SUFFIX}"
 fi
 COSMOS3_ONNX_WEIGHT="${COSMOS3_ONNX_WEIGHT:-${COSMOS3_EXTERNAL_DATA_DEFAULT}}"
+COSMOS3_DEPLOY_ONNX_WEIGHT="${COSMOS3_ONNX_WEIGHT}"
+if [[ "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" == "1" ]]; then
+    COSMOS3_DEPLOY_ONNX_WEIGHT="${COSMOS3_TRANSPOSED_ONNX_WEIGHT:-${COSMOS3_ONNX_FINAL}.transposed${COSMOS3_EXTERNAL_DATA_SUFFIX}}"
+fi
 COSMOS3_REWRITE_REPORT="${COSMOS3_ONNX_COMPATIBLE}.rewrite.json"
 COSMOS3_PROMPT_EMBEDDING="${COSMOS3_ONNX_COMPATIBLE}.prompt_embedding.npy"
 COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
@@ -160,12 +173,21 @@ REWRITE_ARGS=(
 if [[ "${COSMOS3_DECOMPOSE_GEMM}" == "1" ]]; then
     REWRITE_ARGS+=(--decompose-gemm)
 fi
+if [[ "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" == "1" ]]; then
+    REWRITE_ARGS+=(
+        --materialize-gemm-weight-transposes
+        --transposed-external-data-path "${COSMOS3_DEPLOY_ONNX_WEIGHT}"
+    )
+fi
 if ! python3 "${REWRITE_ARGS[@]}"
 then
     rm -f -- \
         "${COSMOS3_ONNX_COMPATIBLE}" \
         "${COSMOS3_REWRITE_REPORT}" \
         "${COSMOS3_PROMPT_EMBEDDING}"
+    if [[ "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" == "1" ]]; then
+        rm -f -- "${COSMOS3_DEPLOY_ONNX_WEIGHT}"
+    fi
     exit 1
 fi
 
@@ -203,8 +225,8 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         echo "OMG executable not found or not executable: ${COSMOS3_OMG_BIN}" >&2
         exit 1
     fi
-    if [[ ! -f "${COSMOS3_ONNX_WEIGHT}" ]]; then
-        echo "ONNX external weight file not found: ${COSMOS3_ONNX_WEIGHT}" >&2
+    if [[ ! -f "${COSMOS3_DEPLOY_ONNX_WEIGHT}" ]]; then
+        echo "ONNX external weight file not found: ${COSMOS3_DEPLOY_ONNX_WEIGHT}" >&2
         exit 1
     fi
     mkdir -p -- "$(dirname -- "${COSMOS3_OMG_LOG}")"
@@ -215,7 +237,7 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         --output="${COSMOS3_OMC_OUTPUT}" \
         --compress_conf="${COSMOS3_QUANT_PARAMS_FILE}" \
         --target=omc \
-        --weight="${COSMOS3_ONNX_WEIGHT}" \
+        --weight="${COSMOS3_DEPLOY_ONNX_WEIGHT}" \
         --input_shape="${COSMOS3_OMG_INPUT_SHAPE}" \
         --input_type="video_latent:FP16;action_latent:FP16;vision_timestep:FP16;action_timestep:FP16;prompt_embeddings:FP16" \
         --output_type="vision_velocity:FP16;action_velocity:FP16" \
@@ -229,7 +251,6 @@ rm -f -- \
     "${COSMOS3_ONNX_COMPATIBLE}" \
     "${COSMOS3_QUANT_CONFIG}.backup" \
     "${COSMOS3_QUANT_ROOT}/quant_info.txt" \
-    "${COSMOS3_REWRITE_REPORT}" \
     "${COSMOS3_FINALIZE_REPORT}"
 
 echo "========== Done =========="
@@ -237,7 +258,9 @@ echo "DOPT config: ${COSMOS3_QUANT_CONFIG}"
 echo "fake-quant weight: ${COSMOS3_FAKEQUANT_WEIGHT}"
 echo "quant params: ${COSMOS3_QUANT_PARAMS_FILE}"
 echo "final ONNX: ${COSMOS3_ONNX_FINAL}"
-echo "ONNX external data: ${COSMOS3_ONNX_WEIGHT}"
+echo "source ONNX external data: ${COSMOS3_ONNX_WEIGHT}"
+echo "deployment ONNX external data: ${COSMOS3_DEPLOY_ONNX_WEIGHT}"
+echo "rewrite report: ${COSMOS3_REWRITE_REPORT}"
 echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
 echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"

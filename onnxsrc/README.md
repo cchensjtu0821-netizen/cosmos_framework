@@ -41,7 +41,15 @@ sampler, CFG loop, or action postprocessing.
    compatibility rewrite also repairs older exports by inlining small external
    Constant attributes before rewriting.
 5. The existing Policy compatibility rewrite removes target-unsupported
-   operators and lowers vision ranks.
+   operators and lowers vision ranks. `COSMOS3_DECOMPOSE_GEMM=1` optionally
+   lowers default-scale `Gemm` to `MatMul` plus a bias `Add` when needed.
+   Adding `COSMOS3_TRANSPOSE_GEMM_WEIGHTS=1` physically transposes every
+   `transB=1` Linear weight in a distinct copy of the external-data file, so
+   each replacement `MatMul` reads the transposed initializer directly and no
+   weight `Transpose` node is emitted. The original external data is preserved
+   for Step-5 ORT comparison. This mode requires enough free disk space for a
+   second full external-data file; override its path with
+   `COSMOS3_TRANSPOSED_ONNX_WEIGHT`.
 6. `finalize_onnx.py` assigns every node a unique non-empty name, bypasses
    redundant `Identity` nodes immediately before graph outputs for OMG
    compatibility, normalizes safe nonzero `Reshape.allowzero` attributes, and
@@ -76,6 +84,14 @@ sampler, CFG loop, or action postprocessing.
 All paths are supplied through environment variables in
 `run_cosmos3_quant_onnx_full.sh`. Copy that file or override its variables;
 do not commit private checkpoints, generated models, quant files, or reports.
+
+The physically transposed-weight mode is an explicit backend experiment. The
+rewrite report must show `materialize_gemm_weight_transposes=true`, every
+transposed weight and its old/new shape, and ORT output metrics. Step 7 still
+requires complete quant-name coverage, but name coverage alone does not prove
+that a backend interprets per-channel INT8 scales along the intended axis after
+the weight layout changes. Checker, original-versus-rewritten output comparison,
+and OMG/OMC validation therefore remain mandatory.
 
 The synthetic layout is reconstructed from the shape manifest written beside
 an existing FP32 Policy ONNX. No image is read, and the tokenizer, VAE encode,
