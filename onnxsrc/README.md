@@ -159,3 +159,25 @@ The compatibility rewrite emits one prompt embedding table even when DOPT
 embedding separation is disabled. This table is a required deployment input:
 the restricted graph replaces the unsupported token-embedding `Gather` with a
 `prompt_embeddings` graph input, so the host must perform that lookup.
+
+## Synthetic OMC input binaries
+
+Generate deterministic smoke-test inputs for the fixed rank-lowered Edge
+Policy OMC boundary:
+
+```bash
+python -m cosmos_framework.onnxsrc.generate_omc_input_bins \
+  --output-dir outputs/omc_inputs \
+  --seed 0 \
+  --timestep 500
+```
+
+The command writes one headerless, C-order, little-endian FP16 `.bin` per
+input plus `manifest.json` using only the Python standard library. The fixed
+order and shapes are
+`video_latent:[48,9,33,40]`, `action_latent:[33,64]`,
+`vision_timestep:[2720]`, `action_timestep:[32]`, and
+`prompt_embeddings:[108,2048]`. Existing files are preserved unless
+`--overwrite` is supplied. These random tensors are only for OMC loading and
+interface smoke tests; they are not substitutes for tokenizer, VAE, sampler,
+or host-side prompt-embedding preprocessing outputs.
