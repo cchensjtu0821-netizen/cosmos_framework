@@ -277,13 +277,13 @@ def build_h100_slide(c):
     c.rect(px, py, pw, ph, COLORS["panel"], COLORS["hair"], 18, 2)
     c.badge(px + 24, py + 20, 44, "03", COLORS["green"])
     c.text(px + 82, py + 15, 600, 38, "性能数据与瓶颈分析", 27, COLORS["ink"], True)
-    c.text(px + 920, py + 22, 840, 26, "稳定态 = request 4–5 均值｜父子区间嵌套，不可直接相加", 15, COLORS["muted"], False, "right")
+    c.text(px + 860, py + 22, 900, 26, "纯模型推理口径｜不含 WebSocket / SSH / 服务包装", 15, COLORS["muted"], False, "right")
 
     kpis = [
-        ("377.79 ms", "稳定端到端 · request 4–5", COLORS["red"], COLORS["soft_red"]),
-        ("2.647 req/s", "单请求串行吞吐", COLORS["blue"], COLORS["soft_blue"]),
-        ("231.83 ms", "sampler · 61.37% E2E", COLORS["amber"], COLORS["soft_amber"]),
-        ("117.087 TF", "理论计算量 / request", COLORS["green"], COLORS["soft_green"]),
+        ("312.75 ms", "generator_total · 模型推理", COLORS["red"], COLORS["soft_red"]),
+        ("3.197 inf/s", "单实例串行推理吞吐", COLORS["blue"], COLORS["soft_blue"]),
+        ("231.83 ms", "sampler · 74.13% 推理", COLORS["amber"], COLORS["soft_amber"]),
+        ("117.087 TF", "理论计算量 / 次推理", COLORS["green"], COLORS["soft_green"]),
         ("8,438.66 MiB", "peak alloc · reserved 8,644", COLORS["navy"], COLORS["soft_navy"]),
     ]
     kx, ky, kw, kg = px + 28, py + 72, 334, 14
@@ -315,27 +315,27 @@ def build_h100_slide(c):
 
     table_y = py + 188
     latency_rows = [
-        ("request_total", "377.79", "100% E2E", "正式 request 4–5 均值"),
-        ("generator_total", "312.75", "82.79% E2E", "prepare + sampler 上层区间"),
-        ("build_sample", "61.67", "16.32% E2E", "CPU 观测预处理"),
-        ("prepare_data_total", "75.90", "20.09% E2E", "condition / VAE / initial pack"),
-        ("vae_encode", "9.92", "2.63% E2E", "视觉条件编码，非主瓶颈"),
-        ("sampler_total", "231.83", "61.37% E2E", "4-step · 8 次网络调用"),
-        ("network_forward", "222.635", "96.03% sampler", "8 次 forward 累计"),
-        ("mot_joint_forward", "178.407", "80.13% network", "MoT 主干，首要 GPU 瓶颈"),
+        ("generator_total", "312.75", "100% 推理", "prepare + sampler 总区间"),
+        ("prepare_data_total", "75.90", "24.27% 推理", "condition / VAE / initial pack"),
+        ("vae_encode", "9.92", "3.17% 推理", "视觉条件编码，非主瓶颈"),
+        ("sampler_total", "231.83", "74.13% 推理", "4-step · 4C + 4U"),
+        ("network_forward", "222.635", "71.19% 推理", "占 sampler 96.03%"),
+        ("mot_joint_forward", "178.407", "57.05% 推理", "占 network 80.13%"),
+        ("encode_vision", "7.478", "2.39% 推理", "视觉 latent 输入投影"),
+        ("build_attention", "6.399", "2.05% 推理", "mask / layout / 索引构造"),
     ]
     draw_table(
         px + 28,
         table_y,
-        "A｜稳定态推理时间（ms）",
+        "A｜稳定态模型推理时间（ms）",
         [220, 130, 170, 330],
-        ["模块", "平均耗时", "占父区间 / E2E", "结论"],
+        ["模块", "平均耗时", "占模型推理", "结论"],
         latency_rows,
         COLORS["navy"],
     )
 
     flops_rows = [
-        ("request / generator", "117.087", "100.00%", "309.9 TF/s · E2E"),
+        ("generator_total", "117.087", "100.00%", "374.4 TF/s · 推理总区间"),
         ("VAE encode", "1.074", "0.92%", "108.3 TF/s"),
         ("sampler / network", "116.012", "99.08%", "500.4 TF/s · sampler"),
         ("MoT joint forward", "115.973", "99.05%", "650.0 TF/s · MoT"),
@@ -349,24 +349,24 @@ def build_h100_slide(c):
         table_y,
         "B｜理论计算量与折算速率",
         [220, 160, 160, 310],
-        ["模块", "TFLOPs / 请求", "占请求 FLOPs", "稳定态折算速率 / 观察"],
+        ["模块", "TFLOPs / 次推理", "占推理 FLOPs", "稳定态折算速率 / 观察"],
         flops_rows,
         COLORS["green"],
     )
 
-    c.text(px + 28, py + 462, 1710, 20, "结论｜MoT 承担 99.05% 理论 FLOPs、占 network 80.13% 时间；CFG 使每请求执行 4C+4U。首请求 22.00 s 属编译冷启动，必须 readiness 预热。", 13, COLORS["red"], True)
+    c.text(px + 28, py + 462, 1710, 20, "结论｜MoT 承担 99.05% 理论 FLOPs、占模型推理 57.05% 时间；Sampler 占 74.13%，CFG 每次推理执行 4C + 4U。", 13, COLORS["red"], True)
 
-    c.text(56, 1037, 1660, 22, "Source: RoboLab Edge Policy Server 推理性能分析报告 · requests 1–5 · 2026-07-27", 13, COLORS["muted"])
+    c.text(56, 1037, 1660, 22, "Source: RoboLab Edge Policy Server 推理性能分析报告 · stable samples 4–5 · 2026-07-27", 13, COLORS["muted"])
     c.text(1720, 1037, 144, 22, "2026.08", 13, COLORS["muted"], True, "right")
 
     c.set_notes(
         "讲解要点：RoboLab 客户端运行在 RTX 4090，观测通过 SSH 端口转发后的 WebSocket 发往 H100 上的 "
-        "Cosmos3-Edge Policy Server，返回 [32,8] action 后闭环执行。报告覆盖 requests 1–5，正式稳定态只取 "
-        "warmup=false 的 request 4–5，均值 377.79 ms；n=2 只能用于初步性能判断，不能给出可靠 P95/P99。"
-        "4-step、guidance=3 每请求执行 4 次 conditional 和 4 次 unconditional。network_forward 的 222.635 ms 是 8 次调用的累计值，"
-        "不是单次 forward；sampler 总计 231.83 ms。理论计算量 117.087 TFLOPs/request，其中 MoT joint forward 为 115.973 TFLOPs，"
+        "Cosmos3-Edge Policy Server，返回 [32,8] action 后闭环执行；该拓扑只解释测试环境，不进入性能口径。"
+        "本页从 generator_total 开始统计纯模型推理，排除 WebSocket、SSH、build_sample 和服务包装。稳定模型推理为 312.75 ms，"
+        "对应单实例串行 3.197 inference/s。4-step、guidance=3 每次推理执行 4 次 conditional 和 4 次 unconditional。"
+        "network_forward 的 222.635 ms 是 8 次调用的累计值，sampler 总计 231.83 ms。理论计算量 117.087 TFLOPs/次推理，其中 MoT joint forward 为 115.973 TFLOPs，"
         "是首要 GPU 瓶颈。稳定峰值显存为 8438.66 MiB allocated、8644 MiB reserved，request 2–5 无增长。"
-        "首请求 22.00 秒来自编译和初始化，部署前必须执行 2–3 次相同 shape 的 readiness warmup。模型效果区域由用户补入素材。"
+        "模型效果区域由用户补入素材。"
     )
 
 
