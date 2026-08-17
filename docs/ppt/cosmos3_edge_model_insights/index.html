@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NVIDIA Cosmos3-Edge 模型洞察与竞品分析</title>
+  <link rel="stylesheet" href="assets/fonts.css">
+  <link rel="stylesheet" href="assets/base.css">
+  <link rel="stylesheet" id="theme-link" href="assets/themes/engineering-whiteprint.css">
+  <link rel="stylesheet" href="assets/animations/animations.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="single cosmos-insight" data-themes="engineering-whiteprint" data-theme-base="assets/themes/">
+  <div class="deck">
+    <section class="slide is-active" data-title="模型分析情况">
+      <header class="slide-head">
+        <div>
+          <p class="kicker">MODEL INSIGHT / COMPETITIVE LANDSCAPE</p>
+          <h1>NVIDIA Cosmos3-Edge <span>模型洞察与竞品分析</span></h1>
+        </div>
+        <div class="page-chip"><b>01</b><span>模型分析情况</span></div>
+      </header>
+
+      <main class="main-grid">
+        <section class="panel architecture-panel" aria-label="Edge 单次推理架构">
+          <div class="section-title">
+            <div><span class="section-no">1</span><h2>模型架构解析</h2></div>
+            <p>当前 32-action Edge 部署画像 · 单次请求（不含 WebSocket 收发）</p>
+          </div>
+
+          <div class="pipeline anim-fade-up" data-anim="fade-up">
+            <div class="stage-row stage-row-top">
+              <article class="node">
+                <span class="node-id">01</span>
+                <h3>build_sample</h3>
+                <p>当前观测扩展为条件帧 + 未来占位</p>
+                <code>RGB 540×640×3 · state 8D · prompt</code>
+                <code>V [3,33,540,640] · A [33,8]</code>
+              </article>
+              <div class="arrow">→</div>
+              <article class="node important">
+                <span class="flag">① 对齐训练输入</span>
+                <span class="node-id">02</span>
+                <h3>ActionTransformPipeline</h3>
+                <p>resize / padding / prompt 格式 / action 补宽</p>
+                <code>V [3,33,544,736]</code>
+                <code>A [33,64]（真实 8D + 56D pad）</code>
+              </article>
+              <div class="arrow">→</div>
+              <article class="node compact-node">
+                <span class="node-id">03</span>
+                <h3>build_batch</h3>
+                <p>增加 batch 与采样元数据</p>
+                <code>V [1,3,33,544,736]</code>
+              </article>
+            </div>
+
+            <div class="down-arrow">↓</div>
+
+            <section class="group prepare-group">
+              <div class="group-label">
+                <b>prepare_data_total</b>
+                <span>把像素、文本、状态变成可送入 MoT 的 packed tokens</span>
+              </div>
+              <div class="subflow four">
+                <article class="subnode important">
+                  <span class="flag">② 视觉压缩</span>
+                  <h4>get_data_and_condition</h4>
+                  <p>Wan2.2 causal VAE encode</p>
+                  <code>[1,3,33,544,736]</code>
+                  <code>→ [1,48,9,34,46]</code>
+                  <code>crop → [1,48,9,33,40]</code>
+                </article>
+                <div class="mini-arrow">→</div>
+                <article class="subnode">
+                  <h4>tokenize_text</h4>
+                  <p>条件 / 无条件 prompt</p>
+                  <code>cond 105 → 107</code>
+                  <code>uncond 17 → 19</code>
+                </article>
+                <div class="mini-arrow">→</div>
+                <article class="subnode important">
+                  <span class="flag">③ 多模态装箱</span>
+                  <h4>initial_pack</h4>
+                  <p>text + 3,060 vision + 33 action</p>
+                  <code>Lcond = 3,200</code>
+                  <code>Luncond = 3,112</code>
+                  <code>hidden = 2,048</code>
+                </article>
+                <div class="mini-arrow">→</div>
+                <article class="subnode">
+                  <h4>initialize noise</h4>
+                  <p>vision/action 联合扩散状态</p>
+                  <code>570,240 + 2,112</code>
+                  <code>= 572,352 elems</code>
+                  <code>timestep 2,720 / 32</code>
+                </article>
+              </div>
+            </section>
+
+            <div class="down-arrow">↓</div>
+
+            <section class="group sampler-group">
+              <div class="loop-badge"><b>4×</b><span>UniPC steps</span></div>
+              <div class="group-label">
+                <b>sampler_total</b>
+                <span>每一步做条件/无条件两次 MoT forward，再用 CFG 合成 velocity</span>
+              </div>
+              <div class="subflow three">
+                <article class="subnode mot-node">
+                  <h4>conditional_forward</h4>
+                  <code>MoT [3,200,2,048]</code>
+                  <code>ΔV [1,48,9,33,40]</code>
+                  <code>ΔA [33,64]</code>
+                </article>
+                <div class="mini-arrow">＋</div>
+                <article class="subnode mot-node">
+                  <h4>unconditional_forward</h4>
+                  <code>MoT [3,112,2,048]</code>
+                  <code>guidance ≠ 1 时启用</code>
+                </article>
+                <div class="mini-arrow">→</div>
+                <article class="subnode important cfg-node">
+                  <span class="flag">④ CFG 合流</span>
+                  <h4>CFG velocity</h4>
+                  <code>u + 3.0 × (c − u)</code>
+                  <p><b>4 步 × 2 分支 = 8 次</b>网络前向</p>
+                </article>
+              </div>
+            </section>
+
+            <div class="down-arrow">↓</div>
+
+            <div class="stage-row stage-row-bottom">
+              <article class="node output-node">
+                <span class="node-id">07</span>
+                <h3>action_postprocess</h3>
+                <p>截真实通道、去 state 行、恢复 gripper 约定</p>
+                <code>[33,64] → [33,8] → <b>[32,8]</b></code>
+              </article>
+              <div class="branch-line"></div>
+              <article class="node optional-node">
+                <span class="optional">OPTIONAL</span>
+                <h3>vae_decode</h3>
+                <p>仅 <code>--decode-video</code>；默认关闭</p>
+                <code>video latent → RGB rollout</code>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <aside class="right-column">
+          <section class="panel spec-panel">
+            <div class="section-title compact-title">
+              <div><span class="section-no">2</span><h2>参数与计算复杂度</h2></div>
+              <p>结构规格 + 单次决策计算画像</p>
+            </div>
+            <div class="table-wrap">
+              <table class="spec-table">
+                <thead>
+                  <tr><th>模型</th><th>参数</th><th>Transformer</th><th>宽度 / 注意力</th><th>单次决策计算画像</th></tr>
+                </thead>
+                <tbody>
+                  <tr class="focus-row">
+                    <td><b>Cosmos3-Edge</b><span>Policy-DROID</span></td>
+                    <td><strong>4B</strong><span>dense 2B × MoT 双塔</span></td>
+                    <td><strong>28 层</strong><span>FFN 9,216</span></td>
+                    <td><strong>2,048</strong><span>16Q / 8KV · d=128</span></td>
+                    <td><strong>8× MoT forward</strong><span>L=3,200 / 3,112 · attention O(L²H)</span></td>
+                  </tr>
+                  <tr>
+                    <td><b>Cosmos3-Nano</b><span>Policy-DROID</span></td>
+                    <td><strong>16B</strong><span>dense 8B × MoT 双塔</span></td>
+                    <td><strong>36 层</strong><span>FFN 12,288</span></td>
+                    <td><strong>4,096</strong><span>32Q / 8KV · d=128</span></td>
+                    <td><strong>同配置 8× forward</strong><span>L≈3,660*；深度/宽度显著更高</span></td>
+                  </tr>
+                  <tr>
+                    <td><b>LingBot-VA</b><span>shared backbone</span></td>
+                    <td><strong>5.3B</strong><span>Wan2.2-5B + action 0.35B</span></td>
+                    <td><strong>30 层</strong><span>视频/动作双流 MoT</span></td>
+                    <td><strong>3,072 / 768</strong><span>video / action</span></td>
+                    <td><strong>3-step V + 10-step A</strong><span>AR chunk K=4 · KV cache + async</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="table-note">* Nano 序列长为同一 32-step profiling 布局推导；三者 sampler、token 布局不同，不把参数量直接等同于端到端时延。</p>
+          </section>
+
+          <section class="panel innovation-panel">
+            <div class="section-title compact-title">
+              <div><span class="section-no">3</span><h2>具身关键创新</h2></div>
+              <p>Cosmos 3 论文主张 × LingBot-VA 对照</p>
+            </div>
+            <div class="innovation-grid">
+              <article class="innovation-card">
+                <span class="innovation-id">A</span>
+                <h3>理解与动作共骨干</h3>
+                <p>Reasoner 的离散 AR 路径与 video/action 的连续 diffusion 路径，在统一 MoT 中联合注意；指令理解、世界预测、动作生成不再是三套模型。</p>
+              </article>
+              <article class="innovation-card">
+                <span class="innovation-id">B</span>
+                <h3>统一动作语义 + 域适配</h3>
+                <p>FD / ID / joint policy 三种动作模式共享表示；domain-aware 输入/输出投影适配不同 embodiment 的动作长度与语义。</p>
+              </article>
+              <article class="innovation-card">
+                <span class="innovation-id">C</span>
+                <h3>Edge 是“缩小后的全能力”</h3>
+                <p>4B 双塔 MoT 保留语言—视觉—动作联合建模；相对 Nano 16B 更接近边缘部署预算，而不是另造一套轻量 Policy 架构。</p>
+              </article>
+            </div>
+            <div class="positioning">
+              <div><b>Cosmos3-Edge 更强项</b><span>更小参数规模；原生物理推理 + 多动作模式；共享骨干、域专属 I/O。</span></div>
+              <div><b>LingBot-VA 更强项</b><span>因果 AR rollout、KV-cache 长时记忆、推理与机器人执行异步并行。</span></div>
+            </div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="source-footer">
+        <span><b>口径：</b>Edge 当前 32-action RoboLab 链路；VAE decode 默认关闭；网络输出采用 PyTorch runtime [33,64]。</span>
+        <span><b>Sources：</b>Cosmos 3 TR / NVIDIA model card · LingBot-VA paper &amp; official repo · local profiling docs</span>
+      </footer>
+
+      <div class="notes">
+        本页从左到右讲三件事。第一，Edge Policy 的单次请求不是一次网络 forward，而是先做输入构造和 VAE 编码，再进入四步 UniPC；默认 guidance=3，因此每步分别执行 conditional 与 unconditional 两次网络前向，总计八次。第二，参数量不能直接代表时延：Edge、Nano 与 LingBot-VA 的 token 布局、采样器和闭环机制不同，所以表格刻意展示真实计算结构，不给出误导性的统一 FLOPs。第三，Cosmos 的具身价值不只是“模态更多”，而是让理解、世界预测和动作生成共享 MoT，并通过 domain-aware 投影处理不同 embodiment。竞争判断要保持克制：Cosmos Edge 在统一性和参数规模上更占优，LingBot-VA 在因果闭环、KV cache 和异步执行上更成熟。
+
+        资料来源：NVIDIA Cosmos 3 Technical Report（arXiv:2606.02800v4）、NVIDIA Cosmos3-Edge-Policy-DROID model card、LingBot-VA: Causal World Modeling for Robot Control（arXiv:2601.21998v2）、Robbyant/lingbot-va 官方仓库，以及仓库内 ROBOLAB_POLICY_EDGE_NANO_IO_SHAPES.md 与 ROBOlab_POLICY_INFERENCE_PROFILING.md。
+      </div>
+    </section>
+  </div>
+  <script src="assets/runtime.js"></script>
+</body>
+</html>
