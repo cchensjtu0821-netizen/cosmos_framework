@@ -123,6 +123,22 @@ class SlideCanvas:
         tri.line.fill.background()
         self.draw.polygon([(x2, y2), left, right], fill=hex_tuple(color))
 
+    def path_arrow(self, points, color="1677FF", width=4, dash=False):
+        """Draw an editable orthogonal/segmented connector with one arrowhead."""
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            self.line(x1, y1, x2, y2, color, width, dash)
+        (x1, y1), (x2, y2) = points[-2], points[-1]
+        angle = math.atan2(y2 - y1, x2 - x1)
+        size = 12
+        left = (x2 - size * math.cos(angle - math.pi / 6), y2 - size * math.sin(angle - math.pi / 6))
+        right = (x2 - size * math.cos(angle + math.pi / 6), y2 - size * math.sin(angle + math.pi / 6))
+        tri = self.slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ISOSCELES_TRIANGLE, inch(x2 - 9), inch(y2 - 9), inch(18), inch(18))
+        tri.rotation = math.degrees(angle) + 90
+        tri.fill.solid()
+        tri.fill.fore_color.rgb = rgb(color)
+        tri.line.fill.background()
+        self.draw.polygon([(x2, y2), left, right], fill=hex_tuple(color))
+
     def text(self, x, y, w, h, value, size=24, color="14213D", bold=False, align="left", valign="top", margin=0, line_spacing=1.0):
         box = self.slide.shapes.add_textbox(inch(x), inch(y), inch(w), inch(h))
         frame = box.text_frame
@@ -163,8 +179,10 @@ class SlideCanvas:
     def save(self):
         notes = self.slide.notes_slide.notes_text_frame
         notes.text = (
-            "讲解要点：左侧按真实 Edge Policy 32-step profiling 展示单次请求；"
-            "默认 guidance=3、4 个 UniPC step，因此条件/无条件共 8 次 MoT 前向。"
+            "讲解要点：左侧严格按 STEP 1→4 阅读。先把服务侧预处理折叠成 video/action/prompt 三路输入；"
+            "prepare_data_total 分别完成 VAE、文本 tokenize，并按 text→vision→action 顺序打包，同时初始化联合噪声；"
+            "sampler_total 以同一 packed condition 和 joint latent 执行条件/无条件 MoT、CFG 合流与 UniPC 更新；"
+            "默认 guidance=3、4 个 UniPC step，因此共 8 次 MoT 前向。最后拆成 action 和可选 video 两路输出。"
             "右侧参数采用 Cosmos 3 与 LingBot-VA 官方论文/模型卡口径。"
             "LingBot-VA 是实时因果双流路线，不宜仅凭参数量宣称吞吐优劣。"
         )
@@ -194,64 +212,106 @@ def build():
     c.text(lx + 84, ly + 17, 760, 38, "Edge 单次推理框图", 28, COLORS["ink"], True)
     c.text(lx + 810, ly + 23, 286, 28, "去除 WebSocket I/O", 16, COLORS["muted"], False, "right")
 
-    # Top I/O preparation chain
-    chain_y = 242
-    c.node(84, chain_y, 260, 88, "build_sample", "RGB 540×640×3 · state 8D\n→ video [3,33,540,640]", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "I/O")
-    c.arrow(348, chain_y + 44, 388, chain_y + 44, COLORS["blue"], 4)
-    c.node(392, chain_y, 310, 88, "ActionTransformPipeline", "resize/pad + action padding\nV [3,33,544,736] · A [33,64]", COLORS["soft_cyan"], "8CCED9", COLORS["cyan"], "T")
-    c.arrow(706, chain_y + 44, 746, chain_y + 44, COLORS["cyan"], 4)
-    c.node(750, chain_y, 378, 88, "build_batch", "增加 batch 维并整理 prompt\nV [1,3,33,544,736] · A [1,33,64]", COLORS["soft_green"], "90CFAD", COLORS["green"], "B")
+    # Step 1: collapse all service-side preprocessing into one audience-level block.
+    c.badge(84, 242, 88, "STEP 1", COLORS["navy"])
+    c.text(184, 242, 190, 30, "输入汇聚", 20, COLORS["ink"], True)
+    c.rect(84, 282, 216, 258, COLORS["soft_navy"], "AFC2D9", 14, 2)
+    c.text(102, 296, 180, 30, "Input & Batch Prep", 20, COLORS["ink"], True, "center")
+    c.text(102, 328, 180, 34, "build_sample / transform / batch", 12, COLORS["muted"], False, "center")
+    input_lanes = [
+        (374, "VIDEO", "[1,3,33,544,736]", COLORS["cyan"], COLORS["soft_cyan"]),
+        (436, "ACTION / STATE", "[33,64] · row0=state", COLORS["amber"], COLORS["soft_amber"]),
+        (498, "PROMPT", "cond / uncond text", COLORS["blue"], COLORS["soft_blue"]),
+    ]
+    for yy, label, shape, accent, fill in input_lanes:
+        c.rect(102, yy, 180, 50, fill, accent, 9, 2)
+        c.text(112, yy + 4, 160, 19, label, 13, accent, True)
+        c.text(112, yy + 23, 160, 20, shape, 12, COLORS["muted"])
 
-    # prepare_data_total container
-    py, ph = 356, 280
-    c.rect(84, py, 1044, ph, "F9FBFE", "AFC2D9", 14, 2)
-    c.badge(100, py + 15, 176, "prepare_data_total", COLORS["navy"])
-    c.text(292, py + 18, 500, 28, "条件编码 · 序列打包 · 扩散初值", 18, COLORS["muted"], True)
+    # Step 2: preparation is a coherent stage with three modality lanes and one merge.
+    c.rect(320, 236, 808, 334, "F9FBFE", "8FB0D3", 15, 3)
+    c.badge(338, 252, 88, "STEP 2", COLORS["blue"])
+    c.badge(438, 252, 176, "prepare_data_total", COLORS["navy"])
+    c.text(630, 254, 466, 26, "模态编码 → 顺序打包 → 联合扩散初值", 17, COLORS["muted"], True)
 
-    c.node(108, 430, 204, 104, "get_data_and_condition", "读取多视角 video / state\n建立条件字典", "FFFFFF", "AFC2D9", COLORS["navy"], None, 15)
-    c.arrow(314, 456, 350, 414, COLORS["navy"], 3)
-    c.arrow(314, 505, 350, 554, COLORS["navy"], 3)
-    c.node(354, 391, 242, 102, "vae_encode", "[1,48,9,34,46]\n→ crop [1,48,9,33,40]", COLORS["soft_cyan"], "8CCED9", COLORS["cyan"], "VAE")
-    c.node(354, 512, 242, 82, "tokenize_text", "cond 105→107 · uncond 17→19", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "TXT")
-    c.arrow(600, 441, 636, 466, COLORS["blue"], 3)
-    c.arrow(600, 560, 636, 525, COLORS["blue"], 3)
-    c.node(640, 430, 232, 116, "initial_pack", "vision 3060 + action 33\ncond L=3200 · uncond L=3112\nhidden = 2048", COLORS["soft_amber"], "EDC881", COLORS["amber"], "PACK")
-    c.node(896, 430, 208, 116, "initialize noise", "V 570,240 + A 2,112\ntimestep: V 2720 / A 32", COLORS["soft_red"], "E9A9B1", COLORS["red"], "ε")
-    c.arrow(874, 488, 892, 488, COLORS["amber"], 3)
-    c.text(102, 606, 984, 24, "关键：文本/视觉/动作被打成一个 packed sequence；条件与无条件 token 长度不同。", 16, COLORS["navy"], True)
+    c.node(348, 314, 230, 108, "VAE Encoder", "video → latent\n[1,48,9,34,46] → [1,48,9,33,40]", COLORS["soft_cyan"], "8CCED9", COLORS["cyan"], "V")
+    c.node(348, 454, 230, 82, "Tokenize Text", "cond 105→107 · uncond 17→19", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "T")
 
-    # sampler_total container
-    sy, sh = 656, 238
-    c.rect(84, sy, 1044, sh, "F9FBFE", "AFC2D9", 14, 2)
-    c.badge(100, sy + 15, 142, "sampler_total", COLORS["navy"])
-    c.badge(946, sy + 15, 158, "UniPC × 4 steps", COLORS["green"])
-    c.text(260, sy + 18, 620, 28, "双分支去噪 → CFG 合流 → latent 更新", 18, COLORS["muted"], True)
+    # Explicit input data routes and shapes.
+    c.arrow(302, 399, 344, 365, COLORS["cyan"], 4)
+    c.path_arrow([(302, 461), (322, 461), (322, 548), (642, 548), (642, 496), (658, 496)], COLORS["amber"], 4)
+    c.arrow(302, 523, 344, 495, COLORS["blue"], 4)
+    c.text(414, 532, 206, 18, "ACTION LATENT [33,64]", 12, COLORS["amber"], True, "center")
 
-    c.node(110, 716, 316, 68, "conditional_forward", "L=3200 → V̇ [1,48,9,33,40] · Ȧ [33,64]", COLORS["soft_blue"], "8FB9ED", COLORS["blue"])
-    c.node(110, 800, 316, 66, "unconditional_forward", "L=3112 · 仅 guidance ≠ 1 启用", COLORS["soft_navy"], "AFC2D9", COLORS["navy"])
-    c.arrow(430, 750, 500, 764, COLORS["blue"], 3)
-    c.arrow(430, 833, 500, 804, COLORS["navy"], 3)
-    diamond = c.slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.DIAMOND, inch(504), inch(730), inch(152), inch(100))
+    # Merge initial_pack and initialize-noise into one logical stage.
+    c.rect(662, 304, 438, 232, COLORS["soft_amber"], "E8BE6A", 14, 3)
+    c.badge(680, 320, 192, "PACK + NOISE INIT", COLORS["amber"])
+    c.text(884, 321, 198, 28, "严格 token 顺序", 16, COLORS["ink"], True, "right")
+    c.arrow(582, 366, 658, 376, COLORS["cyan"], 4)
+    c.text(586, 342, 70, 20, "V-LATENT", 11, COLORS["cyan"], True, "center")
+    c.arrow(582, 496, 658, 454, COLORS["blue"], 4)
+    c.text(584, 476, 72, 20, "TEXT IDS", 11, COLORS["blue"], True, "center")
+
+    # The standard Policy packer is text, then vision, then action.
+    token_cells = [
+        (682, 370, 112, "① TEXT", "C107 / U19", COLORS["blue"], COLORS["soft_blue"]),
+        (798, 370, 144, "② VISION", "3060 patches", COLORS["cyan"], COLORS["soft_cyan"]),
+        (946, 370, 132, "③ ACTION", "33 tokens", COLORS["green"], COLORS["soft_green"]),
+    ]
+    for xx, yy, ww, label, detail, accent, fill in token_cells:
+        c.rect(xx, yy, ww, 60, fill, accent, 8, 2)
+        c.text(xx, yy + 7, ww, 20, label, 13, accent, True, "center")
+        c.text(xx, yy + 31, ww, 18, detail, 12, COLORS["muted"], False, "center")
+    c.arrow(794, 400, 796, 400, COLORS["blue"], 2)
+    c.arrow(942, 400, 944, 400, COLORS["cyan"], 2)
+    c.text(682, 441, 396, 20, "packed hidden: cond [3200,2048] · uncond [3112,2048]", 13, COLORS["navy"], True, "center")
+    c.rect(682, 470, 396, 48, COLORS["soft_red"], "E9A9B1", 8, 2)
+    c.text(692, 474, 376, 18, "JOINT NOISE / LATENT", 12, COLORS["red"], True, "center")
+    c.text(692, 494, 376, 18, "noise_v [1,48,9,33,40]  +  noise_a [33,64]  → flat [572352]", 12, COLORS["muted"], False, "center")
+
+    # One unmistakable hand-off from preparation into the sampler.
+    c.path_arrow([(880, 540), (880, 588), (100, 588), (100, 696), (112, 696)], COLORS["navy"], 5)
+    c.rect(408, 573, 354, 30, COLORS["navy"], COLORS["navy"], 15, 1)
+    c.text(408, 573, 354, 30, "PACKED CONDITIONS + JOINT LATENT", 13, "FFFFFF", True, "center", "middle")
+
+    # Step 3: sampler_total is the main denoising system boundary.
+    sy, sh = 610, 258
+    c.rect(84, sy, 1044, sh, "F9FBFE", "8FB0D3", 15, 3)
+    c.badge(112, sy + 15, 88, "STEP 3", COLORS["green"])
+    c.badge(212, sy + 15, 142, "sampler_total", COLORS["navy"])
+    c.text(372, sy + 18, 520, 26, "双分支 MoT 去噪 → CFG 合流 → joint latent 更新", 17, COLORS["muted"], True)
+    c.badge(946, sy + 14, 158, "UniPC × 4 steps", COLORS["green"])
+
+    c.node(116, 676, 314, 72, "Conditional MoT forward", "C [3200,2048] → v_c{video, action}", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "C", 17)
+    c.node(116, 770, 314, 70, "Unconditional MoT forward", "U [3112,2048] → v_u · guidance≠1", COLORS["soft_navy"], "AFC2D9", COLORS["navy"], "U", 16)
+    c.line(100, 696, 100, 805, COLORS["navy"], 4)
+    c.arrow(100, 805, 112, 805, COLORS["navy"], 4)
+    c.arrow(434, 712, 516, 738, COLORS["blue"], 4)
+    c.arrow(434, 805, 516, 782, COLORS["navy"], 4)
+    diamond = c.slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.DIAMOND, inch(520), inch(710), inch(152), inch(104))
     diamond.fill.solid(); diamond.fill.fore_color.rgb = rgb(COLORS["soft_amber"])
     diamond.line.color.rgb = rgb(COLORS["amber"]); diamond.line.width = Pt(1.2)
-    c.draw.polygon([(580, 730), (656, 780), (580, 830), (504, 780)], fill=hex_tuple(COLORS["soft_amber"]), outline=hex_tuple(COLORS["amber"]))
-    c.text(517, 748, 126, 64, "CFG velocity\nv_u + 3(v_c−v_u)", 16, COLORS["ink"], True, "center", "middle")
-    c.arrow(660, 779, 704, 779, COLORS["amber"], 3)
-    c.node(708, 724, 380, 110, "latent update", "UniPC 更新 vision/action noise\n循环进入下一 timestep", COLORS["soft_green"], "90CFAD", COLORS["green"], "LOOP")
-    c.line(898, 838, 898, 876, COLORS["green"], 3)
-    c.line(898, 876, 96, 876, COLORS["green"], 3)
-    c.line(96, 876, 96, 750, COLORS["green"], 3)
-    c.arrow(96, 750, 106, 750, COLORS["green"], 3)
-    c.text(455, 848, 330, 22, "4 steps × 2 branches = 8 次 MoT forward", 15, COLORS["green"], True, "center")
+    c.draw.polygon([(596, 710), (672, 762), (596, 814), (520, 762)], fill=hex_tuple(COLORS["soft_amber"]), outline=hex_tuple(COLORS["amber"]))
+    c.text(534, 729, 124, 66, "CFG MERGE\nv = v_u + 3(v_c−v_u)", 13, COLORS["ink"], True, "center", "middle")
+    c.arrow(676, 762, 716, 762, COLORS["amber"], 4)
+    c.node(720, 696, 378, 126, "Joint latent update", "UniPC 同步更新两种生成状态\nvideo latent [1,48,9,33,40]\naction latent [33,64]", COLORS["soft_green"], "90CFAD", COLORS["green"], "Z", 18)
 
-    # Outputs
-    c.arrow(330, 896, 330, 916, COLORS["green"], 3)
-    c.node(108, 918, 442, 78, "action_postprocess", "[33,64] → [33,8] → drop state row → [32,8]", COLORS["soft_green"], "90CFAD", COLORS["green"], "OUT")
-    c.arrow(554, 957, 604, 957, COLORS["green"], 4)
-    c.rect(608, 928, 198, 58, COLORS["green"], COLORS["green"], 13, 1)
-    c.text(608, 928, 198, 58, "robot action\n[32, 8]", 19, "FFFFFF", True, "center", "middle")
-    c.arrow(892, 896, 892, 922, COLORS["cyan"], 3, True)
-    c.node(824, 924, 280, 70, "vae_decode（可选）", "仅 --decode-video；Edge 实测未记录", "FFFFFF", "8CCED9", COLORS["cyan"], "OPT")
+    # Loop is visually separated from the forward path.
+    c.path_arrow([(908, 826), (908, 852), (98, 852), (98, 712), (112, 712)], COLORS["green"], 3)
+    c.text(456, 832, 344, 20, "STEP 1→4 · 共 8 次 MoT forward", 14, COLORS["green"], True, "center")
+
+    # Step 4: split the final joint state into action and video generation paths.
+    c.rect(84, 890, 1044, 108, "F9FBFE", "AFC2D9", 14, 2)
+    c.badge(102, 905, 88, "STEP 4", COLORS["amber"])
+    c.text(204, 906, 150, 26, "生成输出", 18, COLORS["ink"], True)
+    c.path_arrow([(966, 826), (966, 880), (424, 880), (424, 916)], COLORS["green"], 4)
+    c.path_arrow([(966, 880), (824, 880), (824, 916)], COLORS["cyan"], 4, True)
+    c.rect(358, 920, 360, 60, COLORS["soft_green"], "90CFAD", 11, 2)
+    c.text(372, 926, 332, 21, "ACTION GENERATION", 14, COLORS["green"], True)
+    c.text(372, 949, 332, 22, "[33,64] → postprocess → robot action [32,8]", 13, COLORS["muted"])
+    c.rect(738, 920, 366, 60, COLORS["soft_cyan"], "8CCED9", 11, 2)
+    c.text(752, 926, 338, 21, "VIDEO GENERATION（可选）", 14, COLORS["cyan"], True)
+    c.text(752, 949, 338, 22, "[1,48,9,33,40] → VAE Decoder → future video", 13, COLORS["muted"])
 
     # Right comparison panel
     rx, rw = 1208, 656
