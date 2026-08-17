@@ -20,8 +20,9 @@ from pptx.util import Inches, Pt
 
 
 ROOT = Path(__file__).resolve().parent
-PPTX_OUT = ROOT / "cosmos3_edge_model_insights_page1.pptx"
-PNG_OUT = ROOT / "cosmos3_edge_model_insights_page1.png"
+PPTX_OUT = ROOT / "cosmos3_edge_model_insights.pptx"
+PNG_OUT_PAGE1 = ROOT / "cosmos3_edge_model_insights_page1.png"
+PNG_OUT_PAGE2 = ROOT / "cosmos3_edge_model_insights_page2.png"
 WIDTH, HEIGHT = 1920, 1080
 PX_PER_INCH = 144
 FONT_FILE = Path(os.environ.get("COSMOS_PPT_FONT", "/tmp/NotoSansCJKsc-Regular.otf"))
@@ -73,11 +74,16 @@ def hex_tuple(hex_color: str):
 class SlideCanvas:
     def __init__(self):
         self.prs = Presentation()
-        self.prs.slide_width = Inches(13.333333)
-        self.prs.slide_height = Inches(7.5)
+        self.prs.slide_width = inch(WIDTH)
+        self.prs.slide_height = inch(HEIGHT)
+        self.images = []
+        self.new_slide()
+
+    def new_slide(self):
         self.slide = self.prs.slides.add_slide(self.prs.slide_layouts[6])
         self.image = Image.new("RGB", (WIDTH, HEIGHT), hex_tuple(COLORS["canvas"]))
         self.draw = ImageDraw.Draw(self.image)
+        self.images.append(self.image)
         self._set_background()
 
     def _set_background(self):
@@ -176,22 +182,192 @@ class SlideCanvas:
         if flag:
             self.badge(x + w - 54, y + 9, 42, flag, accent)
 
-    def save(self):
+    def set_notes(self, value):
         notes = self.slide.notes_slide.notes_text_frame
-        notes.text = (
-            "讲解要点：左侧严格按 STEP 1→4 阅读。先把服务侧预处理折叠成 video/action/prompt 三路输入；"
-            "prepare_data_total 分别完成 VAE、文本 tokenize，并按 text→vision→action 顺序打包，同时初始化联合噪声；"
-            "sampler_total 以同一 packed condition 和 joint latent 执行条件/无条件 MoT、CFG 合流与 UniPC 更新；"
-            "默认 guidance=3、4 个 UniPC step，因此共 8 次 MoT 前向。最后拆成 action 和可选 video 两路输出。"
-            "右侧参数采用 Cosmos 3 与 LingBot-VA 官方论文/模型卡口径。"
-            "LingBot-VA 是实时因果双流路线，不宜仅凭参数量宣称吞吐优劣。"
-        )
+        notes.text = value
+
+    def save(self):
         props = self.prs.core_properties
         props.title = "NVIDIA Cosmos3-Edge 模型洞察与竞品分析"
-        props.subject = "模型分析情况｜架构、参数与具身创新"
+        props.subject = "模型分析情况与 H100 实测情况"
         props.author = "Cosmos Framework"
         self.prs.save(PPTX_OUT)
-        self.image.save(PNG_OUT, optimize=True)
+        preview_paths = [PNG_OUT_PAGE1, PNG_OUT_PAGE2]
+        for image, path in zip(self.images, preview_paths):
+            image.save(path, optimize=True)
+
+
+def build_h100_slide(c):
+    c.new_slide()
+
+    # Header
+    c.badge(56, 40, 86, "BENCH 02", COLORS["navy"])
+    c.text(160, 34, 1180, 60, "H100 实测情况", 46, COLORS["ink"], True)
+    c.text(160, 95, 1180, 32, "RoboLab 远端闭环 · 模块级 profiling · 性能瓶颈定位", 21, COLORS["muted"])
+    c.text(1460, 45, 404, 32, "EDGE POLICY · DROID", 18, COLORS["blue"], True, "right")
+    c.text(1460, 79, 404, 28, "H100 server / RTX 4090 client", 16, COLORS["muted"], False, "right")
+    c.line(56, 140, 1864, 140, COLORS["hair"], 2)
+
+    # 01 Test environment and method
+    ex, ey, ew, eh = 56, 166, 1212, 332
+    c.rect(ex, ey, ew, eh, COLORS["panel"], COLORS["hair"], 18, 2)
+    c.badge(ex + 24, ey + 20, 44, "01", COLORS["blue"])
+    c.text(ex + 82, ey + 15, 360, 38, "测试环境与方法", 27, COLORS["ink"], True)
+    method_badges = [
+        (ex + 544, "4-step · CFG=3", COLORS["blue"]),
+        (ex + 708, "稳定样本 n=2", COLORS["green"]),
+        (ex + 872, "decode video = false", COLORS["amber"]),
+    ]
+    for xx, label, fill in method_badges:
+        c.badge(xx, ey + 19, 146 if "decode" not in label else 196, label, fill)
+
+    # RTX 4090 RoboLab client
+    c.rect(88, 246, 286, 162, COLORS["soft_blue"], "8FB9ED", 14, 3)
+    c.badge(104, 260, 98, "RTX 4090", COLORS["blue"])
+    c.text(104, 303, 254, 28, "RoboLab Client", 22, COLORS["ink"], True, "center")
+    c.text(104, 338, 254, 58, "仿真 / 相机观测 / prompt\n执行 action → 下一帧", 15, COLORS["muted"], False, "center", "middle")
+
+    # SSH tunnel / WebSocket bridge
+    c.arrow(378, 312, 438, 312, COLORS["blue"], 4)
+    c.rect(442, 270, 208, 88, COLORS["soft_amber"], "E8BE6A", 12, 2)
+    c.text(454, 278, 184, 26, "SSH 端口转发", 18, COLORS["ink"], True, "center")
+    c.text(454, 311, 184, 36, "WebSocket request / response\n端口不写死", 13, COLORS["muted"], False, "center")
+    c.arrow(654, 312, 704, 312, COLORS["amber"], 4)
+    c.text(378, 287, 60, 18, "OBS", 12, COLORS["blue"], True, "center")
+
+    # H100 policy server
+    c.rect(708, 232, 516, 184, COLORS["soft_green"], "90CFAD", 14, 3)
+    c.badge(724, 246, 86, "H100", COLORS["green"])
+    c.text(828, 246, 370, 30, "Cosmos3-Edge Policy Server", 22, COLORS["ink"], True)
+    server_stages = [
+        (728, 294, 132, "PREPARE", "VAE / pack"),
+        (872, 294, 164, "SAMPLER", "UniPC ×4 · CFG"),
+        (1048, 294, 156, "OUTPUT", "action [32,8]"),
+    ]
+    for xx, yy, ww, title, detail in server_stages:
+        c.rect(xx, yy, ww, 70, "FFFFFF", "B9DCC9", 9, 2)
+        c.text(xx + 8, yy + 9, ww - 16, 20, title, 14, COLORS["green"], True, "center")
+        c.text(xx + 8, yy + 35, ww - 16, 20, detail, 13, COLORS["muted"], False, "center")
+
+    # Returned action closes the robot-control loop.
+    c.path_arrow([(1112, 420), (1112, 460), (232, 460), (232, 412)], COLORS["green"], 4)
+    c.rect(510, 445, 322, 30, COLORS["green"], COLORS["green"], 15, 1)
+    c.text(510, 445, 322, 30, "ACTION [32,8] · CLOSED LOOP", 13, "FFFFFF", True, "center", "middle")
+    c.text(916, 429, 186, 20, "WebSocket response", 12, COLORS["green"], True, "right")
+
+    # 02 Model-effect placeholders owned by the user.
+    mx, my, mw, mh = 1290, 166, 574, 332
+    c.rect(mx, my, mw, mh, COLORS["panel"], COLORS["hair"], 18, 2)
+    c.badge(mx + 24, my + 20, 44, "02", COLORS["amber"])
+    c.text(mx + 82, my + 15, 360, 38, "模型效果", 27, COLORS["ink"], True)
+    c.badge(mx + 438, my + 19, 112, "待补素材", COLORS["amber"])
+    effect_cards = [
+        (mx + 24, "生成适配效果", "放生成帧 / 对齐结果"),
+        (mx + 292, "机器人操作效果", "放实机图 / 视频二维码"),
+    ]
+    for xx, title, detail in effect_cards:
+        c.rect(xx, my + 78, 258, 220, "F8FAFD", "BFCBDD", 12, 2)
+        c.text(xx, my + 102, 258, 58, "+", 48, "AAB7C8", False, "center", "middle")
+        c.text(xx + 14, my + 172, 230, 28, title, 18, COLORS["ink"], True, "center")
+        c.text(xx + 14, my + 207, 230, 48, detail, 14, COLORS["muted"], False, "center", "middle")
+        c.badge(xx + 58, my + 264, 142, "USER CONTENT", COLORS["navy"])
+
+    # 03 Performance data and bottleneck analysis
+    px, py, pw, ph = 56, 520, 1808, 502
+    c.rect(px, py, pw, ph, COLORS["panel"], COLORS["hair"], 18, 2)
+    c.badge(px + 24, py + 20, 44, "03", COLORS["green"])
+    c.text(px + 82, py + 15, 600, 38, "性能数据与瓶颈分析", 27, COLORS["ink"], True)
+    c.text(px + 920, py + 22, 840, 26, "稳定态 = request 4–5 均值｜父子区间嵌套，不可直接相加", 15, COLORS["muted"], False, "right")
+
+    kpis = [
+        ("377.79 ms", "稳定端到端 · request 4–5", COLORS["red"], COLORS["soft_red"]),
+        ("2.647 req/s", "单请求串行吞吐", COLORS["blue"], COLORS["soft_blue"]),
+        ("231.83 ms", "sampler · 61.37% E2E", COLORS["amber"], COLORS["soft_amber"]),
+        ("117.087 TF", "理论计算量 / request", COLORS["green"], COLORS["soft_green"]),
+        ("8,438.66 MiB", "peak alloc · reserved 8,644", COLORS["navy"], COLORS["soft_navy"]),
+    ]
+    kx, ky, kw, kg = px + 28, py + 72, 334, 14
+    for i, (metric, label, accent, fill) in enumerate(kpis):
+        xx = kx + i * (kw + kg)
+        c.rect(xx, ky, kw, 98, fill, accent, 12, 2)
+        c.rect(xx, ky, 8, 98, accent, accent, 4, 1)
+        c.text(xx + 22, ky + 11, kw - 38, 40, metric, 28, accent, True)
+        c.text(xx + 22, ky + 54, kw - 38, 28, label, 14, COLORS["muted"])
+
+    def draw_table(x, y, title, columns, headers, rows, header_fill):
+        c.text(x, y, sum(columns), 26, title, 17, COLORS["ink"], True)
+        xx, yy = x, y + 30
+        for label, ww in zip(headers, columns):
+            c.rect(xx, yy, ww, 31, header_fill, header_fill, 0, 1)
+            c.text(xx + 4, yy, ww - 8, 31, label, 12, "FFFFFF", True, "center", "middle")
+            xx += ww
+        yy += 31
+        for ri, row in enumerate(rows):
+            xx = x
+            for ci, (value, ww) in enumerate(zip(row, columns)):
+                fill = "F6F9FD" if ri % 2 == 0 else "FFFFFF"
+                if ci == 0:
+                    fill = COLORS["soft_navy"]
+                c.rect(xx, yy, ww, 26, fill, COLORS["hair"], 0, 1)
+                c.text(xx + 4, yy, ww - 8, 26, value, 11, COLORS["ink"] if ci == 0 else COLORS["muted"], ci == 0, "center", "middle")
+                xx += ww
+            yy += 26
+
+    table_y = py + 188
+    latency_rows = [
+        ("request_total", "377.79", "100% E2E", "正式 request 4–5 均值"),
+        ("generator_total", "312.75", "82.79% E2E", "prepare + sampler 上层区间"),
+        ("build_sample", "61.67", "16.32% E2E", "CPU 观测预处理"),
+        ("prepare_data_total", "75.90", "20.09% E2E", "condition / VAE / initial pack"),
+        ("vae_encode", "9.92", "2.63% E2E", "视觉条件编码，非主瓶颈"),
+        ("sampler_total", "231.83", "61.37% E2E", "4-step · 8 次网络调用"),
+        ("network_forward", "222.635", "96.03% sampler", "8 次 forward 累计"),
+        ("mot_joint_forward", "178.407", "80.13% network", "MoT 主干，首要 GPU 瓶颈"),
+    ]
+    draw_table(
+        px + 28,
+        table_y,
+        "A｜稳定态推理时间（ms）",
+        [220, 130, 170, 330],
+        ["模块", "平均耗时", "占父区间 / E2E", "结论"],
+        latency_rows,
+        COLORS["navy"],
+    )
+
+    flops_rows = [
+        ("request / generator", "117.087", "100.00%", "309.9 TF/s · E2E"),
+        ("VAE encode", "1.074", "0.92%", "108.3 TF/s"),
+        ("sampler / network", "116.012", "99.08%", "500.4 TF/s · sampler"),
+        ("MoT joint forward", "115.973", "99.05%", "650.0 TF/s · MoT"),
+        ("encode_vision", "0.01933", "0.0165%", "低 FLOPs / 7.478 ms"),
+        ("vision_head", "0.01925", "0.0164%", "低 FLOPs / 0.686 ms"),
+        ("encode_action", "0.000145", "~0.00012%", "低 FLOPs / 4.813 ms"),
+        ("action_head", "0.000069", "~0.00006%", "低 FLOPs / 0.786 ms"),
+    ]
+    draw_table(
+        px + 906,
+        table_y,
+        "B｜理论计算量与折算速率",
+        [220, 160, 160, 310],
+        ["模块", "TFLOPs / 请求", "占请求 FLOPs", "稳定态折算速率 / 观察"],
+        flops_rows,
+        COLORS["green"],
+    )
+
+    c.text(px + 28, py + 462, 1710, 20, "结论｜MoT 承担 99.05% 理论 FLOPs、占 network 80.13% 时间；CFG 使每请求执行 4C+4U。首请求 22.00 s 属编译冷启动，必须 readiness 预热。", 13, COLORS["red"], True)
+
+    c.text(56, 1037, 1660, 22, "Source: RoboLab Edge Policy Server 推理性能分析报告 · requests 1–5 · 2026-07-27", 13, COLORS["muted"])
+    c.text(1720, 1037, 144, 22, "2026.08", 13, COLORS["muted"], True, "right")
+
+    c.set_notes(
+        "讲解要点：RoboLab 客户端运行在 RTX 4090，观测通过 SSH 端口转发后的 WebSocket 发往 H100 上的 "
+        "Cosmos3-Edge Policy Server，返回 [32,8] action 后闭环执行。报告覆盖 requests 1–5，正式稳定态只取 "
+        "warmup=false 的 request 4–5，均值 377.79 ms；n=2 只能用于初步性能判断，不能给出可靠 P95/P99。"
+        "4-step、guidance=3 每请求执行 4 次 conditional 和 4 次 unconditional。network_forward 的 222.635 ms 是 8 次调用的累计值，"
+        "不是单次 forward；sampler 总计 231.83 ms。理论计算量 117.087 TFLOPs/request，其中 MoT joint forward 为 115.973 TFLOPs，"
+        "是首要 GPU 瓶颈。稳定峰值显存为 8438.66 MiB allocated、8644 MiB reserved，request 2–5 无增长。"
+        "首请求 22.00 秒来自编译和初始化，部署前必须执行 2–3 次相同 shape 的 readiness warmup。模型效果区域由用户补入素材。"
+    )
 
 
 def build():
@@ -220,7 +396,7 @@ def build():
     c.text(102, 328, 180, 34, "build_sample / transform / batch", 12, COLORS["muted"], False, "center")
     input_lanes = [
         (374, "VIDEO", "[1,3,33,544,736]", COLORS["cyan"], COLORS["soft_cyan"]),
-        (436, "ACTION / STATE", "[33,64] · row0=state", COLORS["amber"], COLORS["soft_amber"]),
+        (436, "ACTION / STATE", "batch [1,33,64] · sample [33,64]", COLORS["amber"], COLORS["soft_amber"]),
         (498, "PROMPT", "cond / uncond text", COLORS["blue"], COLORS["soft_blue"]),
     ]
     for yy, label, shape, accent, fill in input_lanes:
@@ -234,7 +410,7 @@ def build():
     c.badge(438, 252, 176, "prepare_data_total", COLORS["navy"])
     c.text(630, 254, 466, 26, "模态编码 → 顺序打包 → 联合扩散初值", 17, COLORS["muted"], True)
 
-    c.node(348, 314, 230, 108, "VAE Encoder", "video → latent\n[1,48,9,34,46] → [1,48,9,33,40]", COLORS["soft_cyan"], "8CCED9", COLORS["cyan"], "V")
+    c.node(348, 314, 230, 108, "VAE Encoder", "仅 frame 0 前缀编码\nraw [1,48,9,34,46]\ncrop → [1,48,9,33,40]", COLORS["soft_cyan"], "8CCED9", COLORS["cyan"], "V")
     c.node(348, 454, 230, 82, "Tokenize Text", "cond 105→107 · uncond 17→19", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "T")
 
     # Explicit input data routes and shapes.
@@ -270,7 +446,7 @@ def build():
     c.text(692, 494, 376, 18, "noise_v [1,48,9,33,40]  +  noise_a [33,64]  → flat [572352]", 12, COLORS["muted"], False, "center")
 
     # One unmistakable hand-off from preparation into the sampler.
-    c.path_arrow([(880, 540), (880, 588), (100, 588), (100, 696), (112, 696)], COLORS["navy"], 5)
+    c.path_arrow([(880, 540), (880, 588), (100, 588), (100, 664)], COLORS["navy"], 5)
     c.rect(408, 573, 354, 30, COLORS["navy"], COLORS["navy"], 15, 1)
     c.text(408, 573, 354, 30, "PACKED CONDITIONS + JOINT LATENT", 13, "FFFFFF", True, "center", "middle")
 
@@ -284,7 +460,9 @@ def build():
 
     c.node(116, 676, 314, 72, "Conditional MoT forward", "C [3200,2048] → v_c{video, action}", COLORS["soft_blue"], "8FB9ED", COLORS["blue"], "C", 17)
     c.node(116, 770, 314, 70, "Unconditional MoT forward", "U [3112,2048] → v_u · guidance≠1", COLORS["soft_navy"], "AFC2D9", COLORS["navy"], "U", 16)
-    c.line(100, 696, 100, 805, COLORS["navy"], 4)
+    c.rect(94, 658, 12, 12, COLORS["green"], COLORS["green"], 6, 1)
+    c.line(100, 664, 100, 805, COLORS["navy"], 4)
+    c.arrow(100, 712, 112, 712, COLORS["navy"], 4)
     c.arrow(100, 805, 112, 805, COLORS["navy"], 4)
     c.arrow(434, 712, 516, 738, COLORS["blue"], 4)
     c.arrow(434, 805, 516, 782, COLORS["navy"], 4)
@@ -297,7 +475,7 @@ def build():
     c.node(720, 696, 378, 126, "Joint latent update", "UniPC 同步更新两种生成状态\nvideo latent [1,48,9,33,40]\naction latent [33,64]", COLORS["soft_green"], "90CFAD", COLORS["green"], "Z", 18)
 
     # Loop is visually separated from the forward path.
-    c.path_arrow([(908, 826), (908, 852), (98, 852), (98, 712), (112, 712)], COLORS["green"], 3)
+    c.path_arrow([(908, 826), (908, 852), (74, 852), (74, 664), (94, 664)], COLORS["green"], 3)
     c.text(456, 832, 344, 20, "STEP 1→4 · 共 8 次 MoT forward", 14, COLORS["green"], True, "center")
 
     # Step 4: split the final joint state into action and video generation paths.
@@ -357,9 +535,9 @@ def build():
 
     card_y = 680
     cards = [
-        ("同体双塔 MoT", "统一 foundation model\n覆盖 reasoning / generation\n/ action 三种模式", COLORS["blue"], COLORS["soft_blue"]),
-        ("Action-native Head", "动作专属 I/O projection\n与 FFN；状态行和未来 action\n同序列扩散", COLORS["amber"], COLORS["soft_amber"]),
-        ("视频-动作联合预测", "future visual 作为辅助监督\n部署时可跳过 decoder\n降低端到端延迟", COLORS["green"], COLORS["soft_green"]),
+        ("Action = 状态转移", "以相邻世界状态之间的\n因果 transition 表示 action\n统一视觉与控制时序", COLORS["blue"], COLORS["soft_blue"]),
+        ("跨本体几何动作", "ego / effector / grasp\n采用相对 SE(3)；domain-aware\nI/O 保留本体差异", COLORS["amber"], COLORS["soft_amber"]),
+        ("FD / ID / Policy 联训", "前向动力学、逆动力学、策略\n共享 MoT；联合预测 future visual\n与 action diffusion", COLORS["green"], COLORS["soft_green"]),
     ]
     x = rx + 24
     for title, detail, accent, fill in cards:
@@ -378,9 +556,19 @@ def build():
     c.text(56, 1037, 1808, 22, "Sources: Cosmos 3 paper (arXiv:2606.02800v4) · NVIDIA Edge Policy model card · LingBot-VA paper/repo · local Edge/Nano profiling", 13, COLORS["muted"], False, "left")
     c.text(1720, 1037, 144, 22, "2026.08", 13, COLORS["muted"], True, "right")
 
+    c.set_notes(
+        "讲解要点：左侧严格按 STEP 1→4 阅读。先把服务侧预处理折叠成 video/action/prompt 三路输入；"
+        "prepare_data_total 分别完成单帧前缀 VAE、文本 tokenize，并按 text→vision→action 顺序打包，同时初始化联合噪声；"
+        "sampler_total 的条件与无条件分支读取同一 joint latent，CFG 合流后由 UniPC 更新这个共享状态，再回送给下一步的两条分支；"
+        "默认 guidance=3、4 个 UniPC step，因此共 8 次 MoT 前向。最后拆成 action 和可选 video 两路输出。"
+        "右侧参数采用 Cosmos 3 与 LingBot-VA 官方论文/模型卡口径。"
+        "具身创新聚焦 action-as-transition、跨本体 SE(3) 动作表示，以及 FD/ID/Policy 联合训练。"
+    )
+    build_h100_slide(c)
     c.save()
     print(PPTX_OUT)
-    print(PNG_OUT)
+    print(PNG_OUT_PAGE1)
+    print(PNG_OUT_PAGE2)
 
 
 if __name__ == "__main__":
