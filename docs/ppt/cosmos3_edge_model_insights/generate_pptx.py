@@ -528,29 +528,24 @@ def build():
         yy += h
     c.text(tx, 562, 610, 18, "* Nano 为同一 profiling 配置口径；架构与 action chunk 是独立配置。", 13, COLORS["muted"])
 
-    # Right innovation panel
+    # Right embodied-innovation panel
     c.rect(rx, 610, rw, 412, COLORS["panel"], COLORS["hair"], 18, 2)
     c.badge(rx + 24, 632, 44, "03", COLORS["green"])
-    c.text(rx + 82, 626, 500, 38, "具身关键创新与竞品定位", 27, COLORS["ink"], True)
+    c.text(rx + 82, 626, 500, 38, "具身关键创新", 27, COLORS["ink"], True)
 
-    card_y = 680
-    cards = [
-        ("Action = 状态转移", "以相邻世界状态之间的\n因果 transition 表示 action\n统一视觉与控制时序", COLORS["blue"], COLORS["soft_blue"]),
-        ("跨本体几何动作", "ego / effector / grasp\n采用相对 SE(3)；domain-aware\nI/O 保留本体差异", COLORS["amber"], COLORS["soft_amber"]),
-        ("FD / ID / Policy 联训", "前向动力学、逆动力学、策略\n共享 MoT；联合预测 future visual\n与 action diffusion", COLORS["green"], COLORS["soft_green"]),
+    innovation_rows = [
+        ("01", "跨具身统一\nAction 表示", "共享几何语义\nDomain-aware I/O Projection 适配不同动作空间", COLORS["blue"], COLORS["soft_blue"]),
+        ("02", "FD / ID / Policy\n三模式共享", "同一 MoT 通过 clean / noisy token 配置\n学习 Forward Dynamics、Inverse Dynamics 与 Policy", COLORS["amber"], COLORS["soft_amber"]),
+        ("03", "Action–Video\n联合策略生成", "同时预测动作及其视觉后果\n用 world-model 信号约束动作生成", COLORS["green"], COLORS["soft_green"]),
     ]
-    x = rx + 24
-    for title, detail, accent, fill in cards:
-        c.rect(x, card_y, 194, 142, fill, accent, 12, 2)
-        c.rect(x, card_y, 194, 7, accent, accent, 3, 1)
-        c.text(x + 14, card_y + 18, 166, 28, title, 18, COLORS["ink"], True, "center")
-        c.text(x + 12, card_y + 52, 170, 80, detail, 12, COLORS["muted"], False, "center", "middle")
-        x += 206
-
-    c.rect(rx + 24, 842, 608, 118, COLORS["soft_navy"], "AFC2D9", 12, 2)
-    c.badge(rx + 40, 857, 136, "vs LingBot-VA", COLORS["navy"])
-    c.text(rx + 190, 850, 420, 46, "优势在“统一模型迁移闭环”", 20, COLORS["navy"], True, "left", "middle")
-    c.text(rx + 40, 900, 564, 48, "Edge：同模型贯通理解→生成→动作；LingBot-VA：面向实时控制的因果双流。\n结论：能力边界更统一 ≠ 已证明实时吞吐更高。", 15, COLORS["muted"], False, "left", "middle")
+    row_y = 680
+    for index, title, detail, accent, fill in innovation_rows:
+        c.rect(rx + 24, row_y, 608, 94, fill, accent, 12, 2)
+        c.rect(rx + 24, row_y, 8, 94, accent, accent, 4, 1)
+        c.badge(rx + 44, row_y + 30, 40, index, accent)
+        c.text(rx + 102, row_y + 13, 210, 68, title, 17, COLORS["ink"], True, "left", "middle")
+        c.text(rx + 316, row_y + 12, 294, 70, detail, 13, COLORS["muted"], False, "left", "middle")
+        row_y += 106
 
     # Footer
     c.text(56, 1037, 1808, 22, "Sources: Cosmos 3 paper (arXiv:2606.02800v4) · NVIDIA Edge Policy model card · LingBot-VA paper/repo · local Edge/Nano profiling", 13, COLORS["muted"], False, "left")
@@ -562,7 +557,8 @@ def build():
         "sampler_total 的条件与无条件分支读取同一 joint latent，CFG 合流后由 UniPC 更新这个共享状态，再回送给下一步的两条分支；"
         "默认 guidance=3、4 个 UniPC step，因此共 8 次 MoT 前向。最后拆成 action 和可选 video 两路输出。"
         "右侧参数采用 Cosmos 3 与 LingBot-VA 官方论文/模型卡口径。"
-        "具身创新聚焦 action-as-transition、跨本体 SE(3) 动作表示，以及 FD/ID/Policy 联合训练。"
+        "具身创新按三条主线讲解：跨具身统一 Action 表示与 Domain-aware I/O Projection；"
+        "FD/ID/Policy 通过 clean/noisy token 配置共享同一 MoT；Action–Video 联合预测用视觉后果约束动作生成。"
     )
     build_h100_slide(c)
     c.save()
