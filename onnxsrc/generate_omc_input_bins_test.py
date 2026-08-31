@@ -8,7 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cosmos_framework.onnxsrc.generate_omc_input_bins import INPUT_SPECS, generate_input_bins
+from cosmos_framework.onnxsrc.generate_omc_input_bins import (
+    INPUT_SHAPE_320X192,
+    INPUT_SPECS,
+    INPUT_SPECS_320X192,
+    generate_input_bins,
+)
 
 
 class GenerateOmcInputBinsTest(unittest.TestCase):
@@ -45,6 +50,28 @@ class GenerateOmcInputBinsTest(unittest.TestCase):
                 [item["sha256"] for item in first["inputs"]],
                 [item["sha256"] for item in second["inputs"]],
             )
+
+    def test_generates_320x192_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            manifest_path = generate_input_bins(
+                output_dir,
+                seed=0,
+                timestep=500.0,
+                overwrite=False,
+                input_specs=INPUT_SPECS_320X192,
+                input_shape=INPUT_SHAPE_320X192,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["input_shape"], INPUT_SHAPE_320X192)
+            self.assertEqual(
+                [item["shape"] for item in manifest["inputs"]],
+                [list(spec.shape) for spec in INPUT_SPECS_320X192],
+            )
+            for spec in INPUT_SPECS_320X192:
+                path = output_dir / f"{spec.name}.bin"
+                self.assertEqual(path.stat().st_size, math.prod(spec.shape) * 2)
 
     def test_refuses_to_overwrite_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

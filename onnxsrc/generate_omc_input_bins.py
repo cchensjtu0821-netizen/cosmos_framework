@@ -38,6 +38,21 @@ INPUT_SPECS = (
     InputSpec("action_timestep", (32,)),
     InputSpec("prompt_embeddings", (108, 2048), 0.02),
 )
+INPUT_SPECS_320X192 = (
+    InputSpec("video_latent", (48, 9, 12, 20), 1.0),
+    InputSpec("action_latent", (33, 64), 0.25),
+    InputSpec("vision_timestep", (480,)),
+    InputSpec("action_timestep", (32,)),
+    InputSpec("prompt_embeddings", (108, 2048), 0.02),
+)
+INPUT_SHAPE_320X192 = (
+    "video_latent:48,9,12,20;action_latent:33,64;vision_timestep:480;"
+    "action_timestep:32;prompt_embeddings:108,2048"
+)
+LAYOUTS = {
+    "480": (INPUT_SPECS, DEFAULT_INPUT_SHAPE),
+    "320x192": (INPUT_SPECS_320X192, INPUT_SHAPE_320X192),
+}
 
 
 def _synthetic_input_bytes(
@@ -82,12 +97,14 @@ def generate_input_bins(
     seed: int,
     timestep: float,
     overwrite: bool,
+    input_specs: tuple[InputSpec, ...] = INPUT_SPECS,
+    input_shape: str = DEFAULT_INPUT_SHAPE,
 ) -> Path:
     if not math.isfinite(timestep) or abs(timestep) > FP16_MAX:
         raise ValueError(f"--timestep must be finite and representable as FP16, got {timestep}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_paths = [output_dir / f"{spec.name}.bin" for spec in INPUT_SPECS]
+    output_paths = [output_dir / f"{spec.name}.bin" for spec in input_specs]
     manifest_path = output_dir / "manifest.json"
     if not overwrite:
         existing_paths = [path for path in (*output_paths, manifest_path) if path.exists()]
@@ -96,7 +113,7 @@ def generate_input_bins(
 
     rng = random.Random(seed)
     inputs: list[dict[str, object]] = []
-    for spec, path in zip(INPUT_SPECS, output_paths, strict=True):
+    for spec, path in zip(input_specs, output_paths, strict=True):
         values = _synthetic_input_bytes(spec, rng=rng, timestep=timestep)
         _write_binary(path, values, overwrite=overwrite)
         minimum, maximum, mean = _summary(values)
@@ -122,9 +139,9 @@ def generate_input_bins(
         "seed": seed,
         "timestep": timestep,
         "layout": "C-order raw little-endian FP16 with no header",
-        "input_shape": DEFAULT_INPUT_SHAPE,
+        "input_shape": input_shape,
         "input_type": DEFAULT_INPUT_TYPE,
-        "input_order": [spec.name for spec in INPUT_SPECS],
+        "input_order": [spec.name for spec in input_specs],
         "inputs": inputs,
     }
     mode = "w" if overwrite else "x"
@@ -138,6 +155,12 @@ def generate_input_bins(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--layout",
+        choices=tuple(LAYOUTS),
+        default="480",
+        help="Fixed OMC input layout (default: 480)",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Synthetic-data random seed (default: 0)")
     parser.add_argument(
         "--timestep",
@@ -147,11 +170,14 @@ def main() -> None:
     )
     parser.add_argument("--overwrite", action="store_true", help="Replace existing generated files")
     args = parser.parse_args()
+    input_specs, input_shape = LAYOUTS[args.layout]
     generate_input_bins(
         args.output_dir,
         seed=args.seed,
         timestep=args.timestep,
         overwrite=args.overwrite,
+        input_specs=input_specs,
+        input_shape=input_shape,
     )
 
 

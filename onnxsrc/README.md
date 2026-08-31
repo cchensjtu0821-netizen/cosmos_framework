@@ -80,8 +80,19 @@ sampler, CFG loop, or action postprocessing.
    other.
 8. `audit_onnx.py` checks ONNX validity, duplicate/empty names, rank limits,
    missing shape metadata, graph I/O, and operator counts.
-9. After the strict audit passes, `run_cosmos3_quant_onnx_full.sh` invokes OMG
-   to convert the named ONNX and its external weight data to OMC. Set
+9. Set `COSMOS3_POWER_PROFILE=1` to opt into a profiling-only postprocess after
+   the strict final audit. The pipeline runs
+   `rewrite_omg_unsupported_patterns.py` with
+   `--bypass-dynamic-trig-for-profiling`, then runs the read-only analyzer and
+   another strict audit on the resulting `.power_profile.onnx`. This bypasses
+   runtime-dependent timestep Sin/Cos values and is intentionally
+   **non-equivalent**; use it only for structural performance/power evaluation,
+   never for accuracy or Policy output validation. The profile ONNX and all
+   report paths are printed at completion.
+10. After the selected graph passes its audit, `run_cosmos3_quant_onnx_full.sh`
+   invokes OMG to convert the named ONNX and its external weight data to OMC.
+   When `COSMOS3_POWER_PROFILE=1`, OMG automatically uses the profile ONNX;
+   otherwise it uses the numerically validated final ONNX. Set
    `COSMOS3_RUN_OMG=0` to stop after ONNX generation and audit. OMG stdout and
    stderr remain visible in the terminal and are also saved to
    `${COSMOS3_QUANT_ROOT}/omg.log`; override `COSMOS3_OMG_LOG` to select another
@@ -172,6 +183,12 @@ python -m cosmos_framework.onnxsrc.generate_omc_input_bins \
   --timestep 500
 ```
 
+For the fixed 320x192 Policy layout, run:
+
+```bash
+python3 onnxsrc/generate_omc_input_bins.py --layout 320x192 --output-dir /srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/omc_inputs_320x192 --seed 0 --timestep 500
+```
+
 The command writes one headerless, C-order, little-endian FP16 `.bin` per
 input plus `manifest.json` using only the Python standard library. The fixed
 order and shapes are
@@ -181,3 +198,6 @@ order and shapes are
 `--overwrite` is supplied. These random tensors are only for OMC loading and
 interface smoke tests; they are not substitutes for tokenizer, VAE, sampler,
 or host-side prompt-embedding preprocessing outputs.
+
+The `320x192` layout changes `video_latent` to `[48,9,12,20]` and
+`vision_timestep` to `[480]`; the other three input shapes are unchanged.

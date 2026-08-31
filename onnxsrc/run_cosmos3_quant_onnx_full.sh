@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 320x192 Edge Policy full-pipeline example:
+# - Step 5 passes --decompose-gemm and --materialize-gemm-weight-transposes.
+# - Step 9a passes --bypass-dynamic-trig-for-profiling (NON-EQUIVALENT; power/performance only).
+# - This host stops after ONNX generation/audit; copy the printed profile ONNX,
+#   transposed PB, and quant_params_v2 to the separate OMG host.
+#
+# env \
+#   COSMOS3_LAYOUT_MANIFEST=/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/edge_policy_320x192.fp32.onnx.json \
+#   COSMOS3_IMAGE_HEIGHT=192 \
+#   COSMOS3_IMAGE_WIDTH=320 \
+#   COSMOS3_RESOLUTION=256 \
+#   COSMOS3_ACTION_CHUNK_SIZE=32 \
+#   COSMOS3_CONDITIONING_FPS=15 \
+#   COSMOS3_QUANT_ROOT=/srv/data2/c00932551/Nvidia_models/cosmos_policy_onnx/quant/edge_policy_320x192_32actions_int8_static \
+#   COSMOS3_OMG_INPUT_SHAPE='video_latent:48,9,12,20;action_latent:33,64;vision_timestep:480;action_timestep:32;prompt_embeddings:108,2048' \
+#   COSMOS3_DECOMPOSE_GEMM=1 \
+#   COSMOS3_TRANSPOSE_GEMM_WEIGHTS=1 \
+#   COSMOS3_POWER_PROFILE=1 \
+#   COSMOS3_START_STEP5=0 \
+#   COSMOS3_RUN_OMG=0 \
+#   bash /srv/data2/c00932551/Nvidia_models/cosmos-framework/cosmos_framework/onnxsrc/run_cosmos3_quant_onnx_full.sh
+
 # =========================
 # 用户配置区
 # 直接修改这里即可；仍可用同名环境变量临时覆盖。
@@ -21,6 +43,7 @@ COSMOS3_START_STEP5="${COSMOS3_START_STEP5:-${COSMOS3_ONLY_STEP5:-0}}"  # 复用
 COSMOS3_MATERIALIZE_MUL_BROADCASTS="${COSMOS3_MATERIALIZE_MUL_BROADCASTS:-0}"  # 默认保留历史隐式 Mul 广播
 COSMOS3_DECOMPOSE_GEMM="${COSMOS3_DECOMPOSE_GEMM:-0}"  # Step 5 可选 Gemm -> MatMul + optional Add
 COSMOS3_TRANSPOSE_GEMM_WEIGHTS="${COSMOS3_TRANSPOSE_GEMM_WEIGHTS:-0}"  # 物理转置权重，避免新增 Transpose 节点
+COSMOS3_POWER_PROFILE="${COSMOS3_POWER_PROFILE:-0}"  # 1: 生成旁路动态 Sin/Cos 的非等价功耗评估图
 COSMOS3_OMG_BIN="${COSMOS3_OMG_BIN:-/srv/data2/c00932551/Nvidia_models/ddk/tools/tools_omg/omg}"
 COSMOS3_OMG_INPUT_SHAPE="${COSMOS3_OMG_INPUT_SHAPE:-video_latent:48,9,33,40;action_latent:33,64;vision_timestep:2720;action_timestep:32;prompt_embeddings:108,2048}"
 
@@ -32,6 +55,10 @@ esac
 case "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" in
     0|1) ;;
     *) echo "COSMOS3_TRANSPOSE_GEMM_WEIGHTS must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${COSMOS3_POWER_PROFILE}" in
+    0|1) ;;
+    *) echo "COSMOS3_POWER_PROFILE must be 0 or 1" >&2; exit 2 ;;
 esac
 if [[ "${COSMOS3_TRANSPOSE_GEMM_WEIGHTS}" == "1" && "${COSMOS3_DECOMPOSE_GEMM}" != "1" ]]; then
     echo "COSMOS3_TRANSPOSE_GEMM_WEIGHTS=1 requires COSMOS3_DECOMPOSE_GEMM=1" >&2
@@ -101,6 +128,15 @@ COSMOS3_PROMPT_EMBEDDING="${COSMOS3_ONNX_COMPATIBLE}.prompt_embedding.npy"
 COSMOS3_FINALIZE_REPORT="${COSMOS3_QUANT_ROOT}/finalize_names.json"
 COSMOS3_MATCH_REPORT="${COSMOS3_QUANT_ROOT}/quant_onnx_name_match.json"
 COSMOS3_AUDIT_REPORT="${COSMOS3_QUANT_ROOT}/onnx_audit.json"
+COSMOS3_POWER_PROFILE_ONNX="${COSMOS3_POWER_PROFILE_ONNX:-${COSMOS3_ONNX_FINAL%.onnx}.power_profile.onnx}"
+COSMOS3_POWER_PROFILE_REWRITE_REPORT="${COSMOS3_POWER_PROFILE_REWRITE_REPORT:-${COSMOS3_POWER_PROFILE_ONNX%.onnx}.rewrite.json}"
+COSMOS3_POWER_PROFILE_EVALUATION_REPORT="${COSMOS3_POWER_PROFILE_EVALUATION_REPORT:-${COSMOS3_POWER_PROFILE_ONNX}.evaluation.json}"
+COSMOS3_POWER_PROFILE_AUDIT_REPORT="${COSMOS3_POWER_PROFILE_AUDIT_REPORT:-${COSMOS3_POWER_PROFILE_ONNX%.onnx}.audit.json}"
+COSMOS3_OMG_MODEL_DEFAULT="${COSMOS3_ONNX_FINAL}"
+if [[ "${COSMOS3_POWER_PROFILE}" == "1" ]]; then
+    COSMOS3_OMG_MODEL_DEFAULT="${COSMOS3_POWER_PROFILE_ONNX}"
+fi
+COSMOS3_OMG_MODEL="${COSMOS3_OMG_MODEL:-${COSMOS3_OMG_MODEL_DEFAULT}}"
 COSMOS3_OMC_OUTPUT="${COSMOS3_OMC_OUTPUT:-${COSMOS3_QUANT_ROOT}/world}"
 COSMOS3_OMG_LOG="${COSMOS3_OMG_LOG:-${COSMOS3_QUANT_ROOT}/omg.log}"
 
@@ -223,8 +259,27 @@ python3 "${COSMOS3_ONNX_SRC_DIR}/audit_onnx.py" \
     --max-rank 4 \
     --report-path "${COSMOS3_AUDIT_REPORT}"
 
+if [[ "${COSMOS3_POWER_PROFILE}" == "1" ]]; then
+    echo "========== Step 9a: build profiling-only ONNX (NON-EQUIVALENT) =========="
+    python3 "${COSMOS3_ONNX_SRC_DIR}/rewrite_omg_unsupported_patterns.py" \
+        --input "${COSMOS3_ONNX_FINAL}" \
+        --output "${COSMOS3_POWER_PROFILE_ONNX}" \
+        --report "${COSMOS3_POWER_PROFILE_REWRITE_REPORT}" \
+        --overwrite \
+        --bypass-dynamic-trig-for-profiling
+
+    echo "========== Step 9b: evaluate and audit profiling-only ONNX =========="
+    python3 "${COSMOS3_ONNX_SRC_DIR}/analyze_omg_unsupported_patterns.py" \
+        --onnx "${COSMOS3_POWER_PROFILE_ONNX}" \
+        --report "${COSMOS3_POWER_PROFILE_EVALUATION_REPORT}"
+    python3 "${COSMOS3_ONNX_SRC_DIR}/audit_onnx.py" \
+        "${COSMOS3_POWER_PROFILE_ONNX}" \
+        --max-rank 4 \
+        --report-path "${COSMOS3_POWER_PROFILE_AUDIT_REPORT}"
+fi
+
 if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
-    echo "========== Step 9: convert audited ONNX to OMC =========="
+    echo "========== Step 10: convert selected audited ONNX to OMC =========="
     if [[ ! -x "${COSMOS3_OMG_BIN}" ]]; then
         echo "OMG executable not found or not executable: ${COSMOS3_OMG_BIN}" >&2
         exit 1
@@ -234,9 +289,10 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         exit 1
     fi
     mkdir -p -- "$(dirname -- "${COSMOS3_OMG_LOG}")"
+    echo "OMG model: ${COSMOS3_OMG_MODEL}"
     echo "OMG log: ${COSMOS3_OMG_LOG}"
     "${COSMOS3_OMG_BIN}" \
-        --model="${COSMOS3_ONNX_FINAL}" \
+        --model="${COSMOS3_OMG_MODEL}" \
         --framework=5 \
         --output="${COSMOS3_OMC_OUTPUT}" \
         --compress_conf="${COSMOS3_QUANT_PARAMS_FILE}" \
@@ -249,7 +305,7 @@ if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
         2>&1 | tee -- "${COSMOS3_OMG_LOG}"
 fi
 
-echo "========== Step 10: remove reproducible intermediate files =========="
+echo "========== Step 11: remove reproducible intermediate files =========="
 rm -f -- \
     "${COSMOS3_ONNX_RAW}" \
     "${COSMOS3_ONNX_COMPATIBLE}" \
@@ -268,7 +324,14 @@ echo "rewrite report: ${COSMOS3_REWRITE_REPORT}"
 echo "prompt embedding table: ${COSMOS3_PROMPT_EMBEDDING}"
 echo "name match report: ${COSMOS3_MATCH_REPORT}"
 echo "audit report: ${COSMOS3_AUDIT_REPORT}"
+if [[ "${COSMOS3_POWER_PROFILE}" == "1" ]]; then
+    echo "profiling-only ONNX (NON-EQUIVALENT): ${COSMOS3_POWER_PROFILE_ONNX}"
+    echo "profiling-only rewrite report: ${COSMOS3_POWER_PROFILE_REWRITE_REPORT}"
+    echo "profiling-only evaluation report: ${COSMOS3_POWER_PROFILE_EVALUATION_REPORT}"
+    echo "profiling-only audit report: ${COSMOS3_POWER_PROFILE_AUDIT_REPORT}"
+fi
 if [[ "${COSMOS3_RUN_OMG}" == "1" ]]; then
+    echo "OMG model: ${COSMOS3_OMG_MODEL}"
     echo "OMC output prefix: ${COSMOS3_OMC_OUTPUT}"
     echo "OMG log: ${COSMOS3_OMG_LOG}"
 fi
