@@ -13,11 +13,7 @@ Server smoke example::
     BASE_CHECKPOINT_PATH=/path/to/Cosmos3-Edge-DCP \
     WAN_VAE_PATH=/path/to/Wan2.2_VAE.pth \
     torchrun --nproc_per_node=8 -m cosmos_framework.scripts.train \
-      --config=cosmos_framework/configs/base/config.py -- \
-      experiment=action_policy_moz1_edge \
-      checkpoint.load_path=$BASE_CHECKPOINT_PATH \
-      model.config.tokenizer.vae_path=$WAN_VAE_PATH \
-      trainer.max_iter=10 checkpoint.save_iter=10
+      --sft-toml=cosmos_framework/configs/toml_config/action_policy_moz1_edge_smoke.toml
 """
 
 from __future__ import annotations
