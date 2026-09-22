@@ -63,6 +63,19 @@ def test_feature_resolution_accepts_leaf_name_and_rejects_ambiguity():
         _resolve_feature(ambiguous, "leftarm_state_cart_pos", role="state")
 
 
+def test_feature_resolution_accepts_moz1_gripper_alias():
+    features = {"leftarm_gripper_state_pos": {"dtype": "float32"}}
+
+    resolved = _resolve_feature(
+        features,
+        "left_gripper_state",
+        role="left gripper state",
+        aliases=("leftarm_gripper_state_pos",),
+    )
+
+    assert resolved == "leftarm_gripper_state_pos"
+
+
 def test_action_chunk_is_direct_concatenation_without_differencing():
     dataset = object.__new__(MOZ1LeRobotDataset)
     dataset._chunk_length = 2

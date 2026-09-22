@@ -171,15 +171,15 @@ class MOZ1LeRobotDataset(BaseActionLeRobotDataset):
         left_wrist_camera_feature: str = "cam_left_wrist",
         right_wrist_camera_feature: str = "cam_right_wrist",
         left_state_feature: str = "leftarm_state_cart_pos",
-        left_gripper_state_feature: str = "left_gripper_state",
+        left_gripper_state_feature: str = "leftarm_gripper_state_pos",
         right_state_feature: str = "rightarm_state_cart_pos",
-        right_gripper_state_feature: str = "right_gripper_state",
+        right_gripper_state_feature: str = "rightarm_gripper_state_pos",
         torso_state_feature: str = "torso_state_cart_pos",
-        left_action_feature: str = "leftarm_action_cart_pos",
-        left_gripper_action_feature: str = "left_gripper_action",
-        right_action_feature: str = "rightarm_action_cart_pos",
-        right_gripper_action_feature: str = "right_gripper_action",
-        torso_action_feature: str = "torso_action_cart_pos",
+        left_action_feature: str = "leftarm_cmd_cart_pos",
+        left_gripper_action_feature: str = "leftarm_gripper_cmd_pos",
+        right_action_feature: str = "rightarm_cmd_cart_pos",
+        right_gripper_action_feature: str = "rightarm_gripper_cmd_pos",
+        torso_action_feature: str = "torso_cmd_cart_pos",
     ) -> None:
         root_path = Path(root)
         info_path = root_path / "meta" / "info.json"
@@ -205,9 +205,19 @@ class MOZ1LeRobotDataset(BaseActionLeRobotDataset):
         }
         self._state_features = (
             _resolve_feature(features, left_state_feature, role="left state"),
-            _resolve_feature(features, left_gripper_state_feature, role="left gripper state"),
+            _resolve_feature(
+                features,
+                left_gripper_state_feature,
+                role="left gripper state",
+                aliases=("left_gripper_state", "left_gripper_state_pos"),
+            ),
             _resolve_feature(features, right_state_feature, role="right state"),
-            _resolve_feature(features, right_gripper_state_feature, role="right gripper state"),
+            _resolve_feature(
+                features,
+                right_gripper_state_feature,
+                role="right gripper state",
+                aliases=("right_gripper_state", "right_gripper_state_pos"),
+            ),
             _resolve_feature(features, torso_state_feature, role="torso state"),
         )
         self._action_features = (
@@ -215,31 +225,36 @@ class MOZ1LeRobotDataset(BaseActionLeRobotDataset):
                 features,
                 left_action_feature,
                 role="left action",
-                aliases=("leftarm_cmd_cart_pos", "leftarm_command_cart_pos", "left_arm_action_cart_pos"),
+                aliases=("leftarm_action_cart_pos", "leftarm_command_cart_pos", "left_arm_action_cart_pos"),
             ),
             _resolve_feature(
                 features,
                 left_gripper_action_feature,
                 role="left gripper action",
-                aliases=("left_gripper_cmd", "left_gripper_cmd_pos", "left_gripper_action_pos"),
+                aliases=("left_gripper_action", "left_gripper_cmd", "left_gripper_cmd_pos", "left_gripper_action_pos"),
             ),
             _resolve_feature(
                 features,
                 right_action_feature,
                 role="right action",
-                aliases=("rightarm_cmd_cart_pos", "rightarm_command_cart_pos", "right_arm_action_cart_pos"),
+                aliases=("rightarm_action_cart_pos", "rightarm_command_cart_pos", "right_arm_action_cart_pos"),
             ),
             _resolve_feature(
                 features,
                 right_gripper_action_feature,
                 role="right gripper action",
-                aliases=("right_gripper_cmd", "right_gripper_cmd_pos", "right_gripper_action_pos"),
+                aliases=(
+                    "right_gripper_action",
+                    "right_gripper_cmd",
+                    "right_gripper_cmd_pos",
+                    "right_gripper_action_pos",
+                ),
             ),
             _resolve_feature(
                 features,
                 torso_action_feature,
                 role="torso action",
-                aliases=("torso_cmd_cart_pos", "torso_command_cart_pos"),
+                aliases=("torso_action_cart_pos", "torso_command_cart_pos"),
             ),
         )
         if stats_path:
