@@ -11,6 +11,7 @@ Server smoke example::
 
     MOZ1_ROOT=/path/to/20260407_merged_123 \
     BASE_CHECKPOINT_PATH=/path/to/Cosmos3-Edge-DCP \
+    EDGE_HF_CHECKPOINT=/path/to/Cosmos3-Edge-Policy-DROID \
     WAN_VAE_PATH=/path/to/Wan2.2_VAE.pth \
     torchrun --nproc_per_node=8 -m cosmos_framework.scripts.train \
       --sft-toml=cosmos_framework/configs/toml_config/action_policy_moz1_edge_smoke.toml
@@ -40,6 +41,16 @@ action_policy_moz1_edge["job"].update(
     wandb_mode="disabled",
 )
 action_policy_moz1_edge["model"]["config"] = copy.deepcopy(EDGE_MODEL_CONFIG)
+
+# EDGE_MODEL_CONFIG points its processor at the public nvidia/Cosmos3-Edge
+# repository.  This smoke is intended to run from a self-contained local Policy
+# snapshot, so remove every Hub selector and dispatch build_processor_lazy via
+# its local-directory mode instead.
+edge_processor_config = action_policy_moz1_edge["model"]["config"]["vlm_config"]["tokenizer"]
+edge_processor_config.pop("repository", None)
+edge_processor_config.pop("revision", None)
+edge_processor_config.pop("subdir", None)
+edge_processor_config["tokenizer_type"] = "${oc.env:EDGE_HF_CHECKPOINT}"
 
 # Start conservatively for the first data-path smoke.  Scale only after a finite
 # 1--10 step run establishes the real memory and throughput envelope.

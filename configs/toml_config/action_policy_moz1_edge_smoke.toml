@@ -5,6 +5,7 @@
 # Required environment variables:
 #   MOZ1_ROOT             LeRobot-v3 dataset root
 #   BASE_CHECKPOINT_PATH  Cosmos3-Edge DCP root containing model/*.distcp
+#   EDGE_HF_CHECKPOINT    Local Edge Policy snapshot containing processor files
 #   WAN_VAE_PATH          Wan2.2_VAE.pth
 #   IMAGINAIRE_OUTPUT_ROOT
 
