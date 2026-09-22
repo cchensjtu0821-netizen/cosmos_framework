@@ -23,6 +23,7 @@ from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset impor
     DROIDLeRobotDataset,
 )
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.moz1_lerobot_dataset import MOZ1LeRobotDataset
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 
 
@@ -39,7 +40,10 @@ class ActionSFTDataset(Dataset):
         return len(self._dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        return self._transform(self._dataset[idx], self._resolution)
+        sample = self._dataset[idx]
+        get_normalizer = getattr(self._dataset, "get_action_normalizer", None)
+        action_normalizer = get_normalizer(sample) if callable(get_normalizer) else None
+        return self._transform(sample, self._resolution, action_normalizer=action_normalizer)
 
     def get_shuffle_blocks(self):
         """Delegate to the inner DROIDLeRobotDataset (per-episode/segment flat-index blocks)."""
@@ -205,6 +209,62 @@ def get_action_libero_sft_dataset(
         pose_coordinate_frame=pose_coordinate_frame,
         action_normalization=action_normalization,
         action_stats_path=action_stats_path,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_moz1_sft_dataset(
+    *,
+    root: str,
+    fps: float = 30.0,
+    chunk_length: int = 16,
+    mode: str = "policy",
+    split: str = "train",
+    split_seed: int = 42,
+    split_val_ratio: float = 0.01,
+    action_normalization: str | None = "quantile",
+    stats_path: str | None = None,
+    sample_stride: int = 1,
+    resolution: str | int | None = "256",
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = False,
+    format_prompt_as_json: bool = True,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+    **feature_overrides: str,
+) -> Dataset:
+    """Build the provisional MOZ1 20-D relative-action SFT dataset."""
+
+    dataset = MOZ1LeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        mode=mode,
+        split=split,
+        split_seed=split_seed,
+        split_val_ratio=split_val_ratio,
+        action_normalization=action_normalization,
+        stats_path=stats_path,
+        sample_stride=sample_stride,
+        **feature_overrides,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
