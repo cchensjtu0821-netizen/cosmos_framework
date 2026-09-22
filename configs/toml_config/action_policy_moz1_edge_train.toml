@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# One-node, 8-GPU MOZ1 Edge action-policy SFT run.
+# With per-rank batch 1 and grad_accum_iter 16, the effective global batch is
+# 128. 10,440 optimizer steps therefore cover approximately one pass over the
+# currently observed 1,336,083-sample training split.
+#
+# Required environment variables:
+#   MOZ1_ROOT             LeRobot-v3 dataset root
+#   BASE_CHECKPOINT_PATH  Cosmos3-Edge DCP root containing model/*.distcp
+#   EDGE_HF_CHECKPOINT    Local Edge Policy snapshot containing processor files
+#   WAN_VAE_PATH          Wan2.2_VAE.pth
+#   IMAGINAIRE_OUTPUT_ROOT
+
+[job]
+task       = "vfm"
+experiment = "action_policy_moz1_edge"
+project    = "cosmos3_action"
+group      = "action_sft"
+name       = "action_policy_moz1_edge_train"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 1.0e-05
+
+[scheduler]
+cycle_lengths = [10440]
+warm_up_steps = [500]
+
+[trainer]
+max_iter        = 10440
+logging_iter    = 10
+grad_accum_iter = 16
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 1000
