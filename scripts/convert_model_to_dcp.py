@@ -13,7 +13,9 @@ init_script(
 
 import math
 import shutil
-from typing import Annotated
+from collections.abc import MutableMapping
+from pathlib import Path
+from typing import Annotated, Any
 
 import pydantic
 import torch
@@ -23,6 +25,7 @@ from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 from cosmos_framework.checkpoint.dcp import CustomSavePlanner
+from cosmos_framework.data.generator.processors.cosmos3_edge_processing import is_cosmos3_edge_native_snapshot
 from cosmos_framework.inference.args import OmniSetupOverrides
 from cosmos_framework.inference.common.args import CheckpointOverrides, ResolvedPath
 from cosmos_framework.inference.common.checkpoints import register_checkpoints
@@ -32,6 +35,7 @@ from cosmos_framework.utils.checkpoint_db import _CHECKPOINTS
 
 
 _AVAE_REGISTRY_URI = "s3://bucket/pretrained/tokenizers/audio/avae"
+_EDGE_REPOSITORY_PREFIX = "nvidia/Cosmos3-Edge"
 
 
 def _redirect_avae_to_local(hf_path):
@@ -50,6 +54,35 @@ def _redirect_avae_to_local(hf_path):
         avae.hf._path = str(sound_tokenizer_dir)
 
 
+def _redirect_edge_processor_to_local(model_dict: MutableMapping[str, Any], hf_path: Path) -> bool:
+    """Use an Edge checkpoint's bundled processor instead of its configured Hub repository."""
+    config = model_dict.get("config")
+    if not isinstance(config, MutableMapping):
+        return False
+    vlm_config = config.get("vlm_config")
+    if not isinstance(vlm_config, MutableMapping):
+        return False
+    tokenizer_config = vlm_config.get("tokenizer")
+    if not isinstance(tokenizer_config, MutableMapping):
+        return False
+
+    target = str(tokenizer_config.get("_target_", "")).rsplit(".", 1)[-1]
+    configured_source = tokenizer_config.get("repository") or tokenizer_config.get("tokenizer_type")
+    if (
+        target != "build_processor_lazy"
+        or not isinstance(configured_source, str)
+        or _EDGE_REPOSITORY_PREFIX not in configured_source
+        or not is_cosmos3_edge_native_snapshot(str(hf_path))
+    ):
+        return False
+
+    tokenizer_config.pop("repository", None)
+    tokenizer_config.pop("revision", None)
+    tokenizer_config.pop("subdir", None)
+    tokenizer_config["tokenizer_type"] = str(hf_path)
+    return True
+
+
 class Args(pydantic.BaseModel):
     checkpoint: CheckpointOverrides
     """Hugging Face checkpoint."""
@@ -63,6 +96,8 @@ def convert_model_to_dcp(args: Args):
     hf_path = checkpoint_config.download_checkpoint()
     _redirect_avae_to_local(hf_path)
     model_dict = checkpoint_config.load_model_config_dict()
+    if _redirect_edge_processor_to_local(model_dict, hf_path):
+        print(f"Using checkpoint-bundled VLM processor from {hf_path}")
     hf_config = Cosmos3OmniConfig(model=build_public_model_config(model_dict))
     hf_model = Cosmos3OmniModel.from_pretrained_dcp(hf_path, config=hf_config)
     state_dict = get_model_state_dict(hf_model.model)
