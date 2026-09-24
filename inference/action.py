@@ -10,9 +10,12 @@ from typing import Any
 import torch
 
 from cosmos_framework.data.generator.action.action_processing import (
+    ActionNormalizer,
     ActionProcessingRecord,
+    StateActionNormalizer,
     make_batched_action_processing_fields,
     pad_action_to_max_dim,
+    resolve_action_normalization,
 )
 from cosmos_framework.data.generator.action.domain_utils import EMBODIMENT_TO_RAW_ACTION_DIM, get_domain_id
 from cosmos_framework.data.generator.action.json_formatter import ActionPromptJsonFormatter
@@ -51,6 +54,15 @@ def _load_actions(
             raise ValueError(f"Unsupported action model_mode: {model_mode}")
 
 
+def _load_moz1_stats(path: Path, block: str) -> dict[str, torch.Tensor]:
+    raw = json.loads(path.read_text())
+    values = raw.get("norm_stats", raw)[block]
+    stats = {key: torch.as_tensor(values[key], dtype=torch.float32) for key in ("q01", "q99")}
+    if any(tensor.shape != (20,) or not bool(torch.isfinite(tensor).all()) for tensor in stats.values()):
+        raise ValueError(f"norm_stats.{block}.q01/q99 must contain 20 finite numbers in {path}")
+    return stats
+
+
 def _format_prompt(
     prompt: str,
     view_point: str,
@@ -58,6 +70,7 @@ def _format_prompt(
     action: torch.Tensor,
     fps: torch.Tensor,
     image_size: torch.Tensor,
+    additional_view_description: str | None = None,
 ) -> str:
     """Helper function to build the action prompt with optional duration and resolution info."""
     data_dict = {
@@ -68,6 +81,8 @@ def _format_prompt(
         "conditioning_fps": fps,
         "image_size": image_size,
     }
+    if additional_view_description is not None:
+        data_dict["additional_view_description"] = additional_view_description
     prompt_json_formatter = ActionPromptJsonFormatter()
     ai_caption = prompt_json_formatter(data_dict)[prompt_json_formatter.caption_key]
     if isinstance(ai_caption, dict):
@@ -88,6 +103,8 @@ def build_action_batch(
     fps: int,
     resolution: str | None = None,
     input_video_key: str,
+    initial_state: torch.Tensor | None = None,
+    action_normalizer: ActionNormalizer | None = None,
     batch_size: int = 1,
     device: Any = "cuda",
 ) -> dict:
@@ -110,10 +127,15 @@ def build_action_batch(
     video_padded = pad_dict["video"]
     padded_image_size = pad_dict["image_size"]
 
+    if initial_state is not None:
+        if model_mode != ModelMode.POLICY or tuple(initial_state.shape) != (raw_action_dim,):
+            raise ValueError("Initial state must be a 1-D raw-width vector in policy mode")
+        action = torch.cat([pad_action_to_max_dim(initial_state[None], action.shape[-1]), action], dim=0)
+
     sequence_plan = build_sequence_plan_from_mode(
         mode=model_mode.value,
         video_length=target_frames,
-        action_length=action_chunk_size,
+        action_length=action.shape[0],
         has_text=True,
     )
 
@@ -124,11 +146,17 @@ def build_action_batch(
         action=action,
         fps=torch.tensor(fps, dtype=torch.long),
         image_size=padded_image_size,
+        additional_view_description=(
+            "The top row is the high third-person camera. The bottom-left and bottom-right views are the left "
+            "and right wrist cameras."
+            if domain_name == "moz1"
+            else None
+        ),
     )
 
     action_processing_record = ActionProcessingRecord(
         raw_action_dim=raw_action_dim,
-        action_normalizer=None,
+        action_normalizer=action_normalizer,
     )
 
     return {
@@ -153,6 +181,8 @@ def get_action_sample_data(
     vision_path: Path,
     model_mode: ModelMode,
     action_path: Path | None,
+    state_path: Path | None = None,
+    stats_path: Path | None = None,
     domain_name: str,
     view_point: str = "ego_view",
     resolution: str,
@@ -174,6 +204,24 @@ def get_action_sample_data(
         "Either action_path or raw_action_dim must be provided"
     )
     action = _load_actions(action_path, model_mode, action_chunk_size, max_action_dim, raw_action_dim)
+    initial_state = None
+    action_normalizer = None
+    if state_path is not None:
+        if model_mode != ModelMode.POLICY or domain_name != "moz1":
+            raise ValueError("state_path is currently supported only for MOZ1 policy inference")
+        if stats_path is None:
+            raise ValueError("stats_path is required with state_path")
+        initial_state_raw = torch.as_tensor(json.loads(Path(state_path).read_text()), dtype=torch.float32)
+        if initial_state_raw.shape != (raw_action_dim,) or not bool(torch.isfinite(initial_state_raw).all()):
+            raise ValueError(f"state_path must contain {raw_action_dim} finite numbers")
+        state_stats = _load_moz1_stats(Path(stats_path), "state")
+        action_stats = _load_moz1_stats(Path(stats_path), "actions")
+        action_normalizer = StateActionNormalizer(
+            state_normalizer=resolve_action_normalization("quantile", state_stats),
+            action_normalizer=resolve_action_normalization("quantile", action_stats),
+            expected_dim=raw_action_dim,
+        )
+        initial_state = action_normalizer.state_normalizer.normalize_action(initial_state_raw)
 
     return build_action_batch(
         video=frames,
@@ -187,6 +235,8 @@ def get_action_sample_data(
         fps=fps,
         resolution=resolution,
         input_video_key=model_config.input_video_key,
+        initial_state=initial_state,
+        action_normalizer=action_normalizer,
         batch_size=batch_size,
         device=device,
     )

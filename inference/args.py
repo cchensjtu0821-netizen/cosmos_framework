@@ -571,6 +571,8 @@ class SoundDataOverrides(OverridesBase):
 
 class ActionDataArgs(ArgsBase):
     action_path: ResolvedFilePath | None = None
+    state_path: ResolvedFilePath | None = None
+    stats_path: ResolvedFilePath | None = None
     domain_name: str = ""
     image_size: pydantic.PositiveInt = 256
     action_chunk_size: pydantic.PositiveInt = 16
@@ -583,6 +585,10 @@ class ActionDataOverrides(OverridesBase):
 
     action_path: Training[ResolvedFilePathOrUrl | None] = None
     """Path to action JSON file. Required for forward_dynamics mode."""
+    state_path: Training[ResolvedFilePathOrUrl | None] = None
+    """Path to a 20-D initial-state JSON file for MOZ1 policy inference."""
+    stats_path: Training[ResolvedFilePathOrUrl | None] = None
+    """Path to the norm_stats.json used when training the MOZ1 checkpoint."""
     domain_name: Training[str | None] = None
     """Action domain name passed to get_domain_id()."""
     image_size: Training[pydantic.PositiveInt | None] = None
@@ -598,6 +604,8 @@ class ActionDataOverrides(OverridesBase):
     def download(self, output_dir: Path):
         super().download(output_dir)
         self.action_path = download_file(self.action_path, output_dir, "action")
+        self.state_path = download_file(self.state_path, output_dir, "state")
+        self.stats_path = download_file(self.stats_path, output_dir, "stats")
 
     def _build_action_data(self, model_config: "OmniMoTModelConfig", sample_meta: SampleMeta):
         if self.domain_name is None:
@@ -622,12 +630,19 @@ class ActionDataOverrides(OverridesBase):
                 if self.action_path is None:
                     raise ValueError(f"'action_path' is required for model_mode={mode.value!r}")
             case ModelMode.INVERSE_DYNAMICS | ModelMode.POLICY:
-                pass
+                if mode == ModelMode.POLICY and self.domain_name.lower().strip() == "moz1" and self.state_path is None:
+                    raise ValueError("MOZ1 policy inference requires 'state_path' for the first conditioned action row")
             case _:
                 assert_never(mode)
 
         if self.action_path and "://" in self.action_path:
             raise ValueError("Must call `download()` before building action data")
+        if self.state_path and "://" in self.state_path:
+            raise ValueError("Must call `download()` before building action data")
+        if self.stats_path and "://" in self.stats_path:
+            raise ValueError("Must call `download()` before building action data")
+        if self.state_path is not None and self.stats_path is None:
+            raise ValueError("'stats_path' is required with 'state_path' to reproduce MOZ1 training normalization")
 
 
 _ReasonerTemperature = Annotated[float, pydantic.Field(gt=0, le=100)]

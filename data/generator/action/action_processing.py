@@ -81,6 +81,33 @@ class ActionAffineNormalization:
 
 
 @dataclass(frozen=True)
+class StateActionNormalizer:
+    """Normalize the first state row separately from subsequent action rows."""
+
+    state_normalizer: ActionNormalizer
+    action_normalizer: ActionNormalizer
+    state_rows: int = 1
+    expected_dim: int | None = None
+
+    def _apply(self, values: torch.Tensor, method: str) -> torch.Tensor:
+        if values.ndim < 2:
+            raise ValueError(f"Expected [..., T, D] state/action tensor, got {tuple(values.shape)}")
+        if self.expected_dim is not None and values.shape[-1] != self.expected_dim:
+            raise ValueError(f"Expected action width {self.expected_dim}, got shape {tuple(values.shape)}")
+        if values.shape[-2] < self.state_rows:
+            raise ValueError(f"Expected at least {self.state_rows} state rows, got shape {tuple(values.shape)}")
+        state = getattr(self.state_normalizer, method)(values[..., : self.state_rows, :])
+        action = getattr(self.action_normalizer, method)(values[..., self.state_rows :, :])
+        return torch.cat([state, action], dim=-2)
+
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        return self._apply(action, "normalize_action")
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        return self._apply(action, "denormalize_action")
+
+
+@dataclass(frozen=True)
 class ActionAsinhNormalization:
     """Invertible heavy-tail action normalizer.
 

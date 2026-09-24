@@ -659,6 +659,8 @@ def get_sample_data(
             vision_path=sample_args.vision_path,
             model_mode=sample_args.model_mode,
             action_path=sample_args.action_path,
+            state_path=sample_args.state_path,
+            stats_path=sample_args.stats_path,
             domain_name=sample_args.domain_name,
             view_point=sample_args.view_point,
             resolution=str(sample_args.image_size),
@@ -1767,7 +1769,14 @@ class OmniInference(Inference):
                                     f"invalid raw_action_dim={raw_action_dim} for action with shape {pred_action.shape}"
                                 )
                                 pred_action = pred_action[..., :raw_action_dim]
+                            if sample_args.model_mode == ModelMode.POLICY and sample_args.state_path is not None:
+                                pred_action = pred_action[1:]  # The conditioned MOZ1 state row is not a future action.
                             content["action"] = pred_action.detach().cpu().tolist()
+                            if sample_args.model_mode == ModelMode.POLICY and sample_args.state_path is not None:
+                                action_file = sample_args.output_dir / "action.json"
+                                action_file.write_text(json.dumps(content["action"], indent=2) + "\n")
+                                files.append(action_file)
+                                content["action_space"] = "dataset_stored_20d"
 
                         sample_output = SampleOutputs(
                             args=sample_args.model_dump(mode="json"),

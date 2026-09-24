@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from cosmos_framework.data.generator.action.action_processing import (
-    ActionNormalizer,
+    StateActionNormalizer,
     resolve_action_normalization,
 )
 from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot import (
@@ -44,34 +43,6 @@ from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot impo
 
 _ACTION_DIM = 20
 _POSE_DIM = 6
-
-
-@dataclass(frozen=True)
-class StateActionNormalizer:
-    """Apply separate normalizers to the absolute state row and action rows."""
-
-    state_normalizer: ActionNormalizer
-    action_normalizer: ActionNormalizer
-    state_rows: int = 1
-
-    def _apply(self, values: torch.Tensor, method: str) -> torch.Tensor:
-        if values.ndim < 2 or values.shape[-1] != _ACTION_DIM:
-            raise ValueError(f"Expected [..., T, {_ACTION_DIM}] state/action tensor, got {tuple(values.shape)}")
-        if values.shape[-2] < self.state_rows:
-            raise ValueError(
-                f"Expected at least {self.state_rows} state rows, got shape {tuple(values.shape)}"
-            )
-        state_fn = getattr(self.state_normalizer, method)
-        action_fn = getattr(self.action_normalizer, method)
-        state = state_fn(values[..., : self.state_rows, :])
-        action = action_fn(values[..., self.state_rows :, :])
-        return torch.cat([state, action], dim=-2)
-
-    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        return self._apply(action, "normalize_action")
-
-    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        return self._apply(action, "denormalize_action")
 
 
 def _unwrap_norm_stats(raw: dict[str, Any], block: str, path: Path) -> dict[str, torch.Tensor]:
@@ -289,6 +260,7 @@ class MOZ1LeRobotDataset(BaseActionLeRobotDataset):
             self._action_normalizer = StateActionNormalizer(
                 state_normalizer=state_normalizer,
                 action_normalizer=self._action_normalizer,
+                expected_dim=_ACTION_DIM,
             )
 
         observation_ts = [i * self._dt for i in range(self._chunk_length + 1)]
