@@ -5,6 +5,7 @@ set -euo pipefail
 # successful single-GPU MOZ1 smoke run.
 cd /srv/data2/c00932551/Nvidia_models/cosmos-framework
 source .venv/bin/activate
+export LD_LIBRARY_PATH=
 
 export MOZ1_ROOT=/srv/data2/20260407_merged_123
 export BASE_CHECKPOINT_PATH=/srv/data2/c00932551/Nvidia_models/Cosmos3-Edge-Policy-DROID-DCP
