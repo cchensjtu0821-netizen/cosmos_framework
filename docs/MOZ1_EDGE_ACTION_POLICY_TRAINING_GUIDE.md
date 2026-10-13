@@ -603,7 +603,13 @@ Iteration 12 / trainer.max_iter 10440
 
 ## 10. 配置文件和启动方式
 
-推荐从仓库根目录启动，所有机器路径均通过环境变量传入，不写死到仓库：
+在训练服务器上执行一键脚本即可启动 8 卡正式训练。脚本会切换到仓库目录、激活 `.venv`、导出本机路径并检查四个输入，再执行 `action_policy_moz1_edge_train.toml`。输出根目录采用已成功单卡试跑日志里的 `/srv/data2/c00932551/cosmos_outputs/test`。
+
+```bash
+bash /srv/data2/c00932551/Nvidia_models/cosmos-framework/cosmos_framework/scripts/run_moz1_edge_train.sh
+```
+
+如需手动启动，也可以从仓库根目录设置相同的环境变量后运行：
 
 ```bash
 cd /path/to/cosmos-framework
@@ -625,6 +631,24 @@ PYTHONPATH=. torchrun \
   -m cosmos_framework.scripts.train \
   --sft-toml=cosmos_framework/configs/toml_config/action_policy_moz1_edge_train.toml
 ```
+
+历史运行快照（用户于 2026-10-13 提供的 `launch_info.yaml` 与已解析 `config.yaml`）：
+
+- 先前的长跑配置使用 `action_policy_moz1_edge_smoke.toml`，通过命令行把任务名设为 `action_policy_moz1_edge_train`，训练步数设为 10,440、梯度累积设为 16、warmup 设为 500、checkpoint 间隔设为 1,000。
+- 有效配置为 8 卡 FSDP（每卡 batch 1）、MOZ1 `train` split、16 步动作、30 FPS、256 分辨率和 quantile action normalization。`run_validation=false`，`dataloader_val=null`。
+- 数据集、基座 DCP、Edge processor 和 Wan2.2 VAE 的实际路径由环境变量解析，保存在该运行的 `config.yaml` 中；`launch_info.yaml` 只记录命令行。此快照不证明训练已跑完 10,440 步。更多参数摘要见 `docs/agent_logs/2026-10-13.md`。
+
+该历史运行的路径（用户明确要求记录；前四项来自其 `config.yaml`，输出根目录由 `sampled_media.output_uri` 按 `callbacks.py` 的路径规则反推，尚未在服务器上核实）：
+
+```bash
+export MOZ1_ROOT=/srv/data2/20260407_merged_123
+export BASE_CHECKPOINT_PATH=/srv/data2/c00932551/Nvidia_models/Cosmos3-Edge-Policy-DROID-DCP
+export EDGE_HF_CHECKPOINT=/srv/data2/c00932551/Nvidia_models/Cosmos3-Edge-Policy-DROID
+export WAN_VAE_PATH=/srv/data2/c00932551/Nvidia_models/Wan2.2/Wan2.2_VAE.pth
+export IMAGINAIRE_OUTPUT_ROOT=/srv/data2/c00932551/cosmos_outputs/moz1_edge_smoke
+```
+
+在训练服务器上先检查这些路径确实存在，再从同一个 shell 启动训练。单卡试跑应使用独立 `job.name`，避免复用上面历史运行的 checkpoint 目录。
 
 正式参数应修改 TOML，而不是每次把 `trainer.max_iter=...` 等覆盖项写在命令行。当前关键配置分布为：
 
