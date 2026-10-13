@@ -58,8 +58,11 @@ export CUDA_VISIBLE_DEVICES="$eval_gpu"
 
 eval_dir="${MOZ1_EVAL_OUT:-$IMAGINAIRE_OUTPUT_ROOT/moz1_open_loop_eval/${checkpoint_name}_$(date +%Y%m%d_%H%M%S)}"
 if [[ -e "$eval_dir" ]]; then
-    echo "Evaluation directory already exists: $eval_dir" >&2
-    exit 1
+    python -m cosmos_framework.scripts.evaluate_moz1_open_loop validate \
+        --out-dir "$eval_dir" --checkpoint-path "$checkpoint_dir"
+    reuse_samples=1
+else
+    reuse_samples=0
 fi
 echo "Evaluating $checkpoint_dir on physical GPU $eval_gpu"
 echo "Output: $eval_dir"
@@ -67,18 +70,21 @@ echo "Output: $eval_dir"
 # Catch the cuBLAS/BF16 failure seen during training before preparing samples.
 python -c 'import torch; x=torch.randn((128,128),device="cuda",dtype=torch.bfloat16); y=x@x; torch.cuda.synchronize(); print("BF16 matmul OK", tuple(y.shape))'
 
-python -m cosmos_framework.scripts.evaluate_moz1_open_loop prepare \
-    --dataset-root "$MOZ1_ROOT" \
-    --checkpoint-path "$checkpoint_dir" \
-    --out-dir "$eval_dir" \
-    --max-samples "${MOZ1_EVAL_SAMPLES:-32}" \
-    --seed 42
+if [[ "$reuse_samples" -eq 0 ]]; then
+    python -m cosmos_framework.scripts.evaluate_moz1_open_loop prepare \
+        --dataset-root "$MOZ1_ROOT" \
+        --checkpoint-path "$checkpoint_dir" \
+        --out-dir "$eval_dir" \
+        --max-samples "${MOZ1_EVAL_SAMPLES:-32}" \
+        --seed 42
+fi
 
 torchrun --standalone --nproc-per-node=1 -m cosmos_framework.scripts.inference \
     --parallelism-preset=throughput \
     --experiment=action_policy_moz1_edge \
     --checkpoint-path="$checkpoint_dir" \
     --no-use-ema-weights \
+    --no-guardrails \
     -i "$eval_dir/inputs/*/sample.json" \
     -o "$eval_dir/predictions"
 

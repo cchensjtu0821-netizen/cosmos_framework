@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cosmos_framework.scripts.evaluate_moz1_open_loop import _action_matrix, score
+from cosmos_framework.scripts.evaluate_moz1_open_loop import _action_matrix, score, validate
 
 
 def _matrix(value: float) -> list[list[float]]:
@@ -58,6 +58,31 @@ class EvaluateMoz1OpenLoopTest(unittest.TestCase):
             _action_matrix(_matrix(float("nan")), name="bad")
         with self.assertRaisesRegex(ValueError, "shape"):
             _action_matrix([[0.0] * 20] * 15, name="short")
+
+    def test_reuse_requires_matching_checkpoint_and_complete_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "checkpoint"
+            case_dir = root / "inputs" / "sample_0"
+            case_dir.mkdir(parents=True)
+            target_path = case_dir / "target_action.json"
+            for path in (case_dir / "sample.json", case_dir / "conditioning.png", case_dir / "state.json", target_path):
+                path.touch()
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "checkpoint_path": str(checkpoint),
+                        "selected_windows": 1,
+                        "samples": [{"name": "sample_0", "target_action": str(target_path)}],
+                    }
+                )
+            )
+            validate(out_dir=root, checkpoint_path=checkpoint)
+            with self.assertRaisesRegex(ValueError, "different checkpoint"):
+                validate(out_dir=root, checkpoint_path=root / "other_checkpoint")
+            target_path.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "incomplete"):
+                validate(out_dir=root, checkpoint_path=checkpoint)
 
 
 if __name__ == "__main__":

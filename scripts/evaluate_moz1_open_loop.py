@@ -3,7 +3,7 @@
 
 """Prepare held-out MOZ1 policy samples and score their open-loop actions.
 
-Run ``prepare`` and ``score`` through ``run_moz1_open_loop_eval.sh`` so inference
+Run ``prepare``, ``validate``, and ``score`` through ``run_moz1_open_loop_eval.sh`` so inference
 loads the checkpoint only once for all selected samples.
 """
 
@@ -153,6 +153,24 @@ def prepare(*, dataset_root: Path, checkpoint_path: Path, out_dir: Path, max_sam
     print(f"Prepared {len(entries)} validation windows from {len(dataset)} candidates in {out_dir}")
 
 
+def validate(*, out_dir: Path, checkpoint_path: Path) -> None:
+    """Only reuse a complete prepared input set for the selected checkpoint."""
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    if Path(manifest["checkpoint_path"]).resolve() != checkpoint_path.resolve():
+        raise ValueError("Prepared samples belong to a different checkpoint")
+    samples = manifest["samples"]
+    if not samples or manifest["selected_windows"] != len(samples):
+        raise ValueError("Prepared sample count does not match manifest")
+    for entry in samples:
+        name = entry["name"]
+        case_dir = out_dir / "inputs" / name
+        for path in (case_dir / "sample.json", case_dir / "conditioning.png", case_dir / "state.json",
+                     Path(entry["target_action"])):
+            if not path.is_file():
+                raise FileNotFoundError(f"Prepared sample {name} is incomplete: {path}")
+    print(f"Reusing {len(samples)} prepared validation windows in {out_dir}")
+
+
 def _summary(predictions: list[list[list[float]]], targets: list[list[list[float]]]) -> dict[str, Any]:
     count = len(predictions)
     if count == 0 or count != len(targets):
@@ -277,6 +295,9 @@ def main() -> None:
     prepare_parser.add_argument("--out-dir", type=Path, required=True)
     prepare_parser.add_argument("--max-samples", type=int, default=32)
     prepare_parser.add_argument("--seed", type=int, default=42)
+    validate_parser = commands.add_parser("validate")
+    validate_parser.add_argument("--out-dir", type=Path, required=True)
+    validate_parser.add_argument("--checkpoint-path", type=Path, required=True)
     score_parser = commands.add_parser("score")
     score_parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -288,6 +309,8 @@ def main() -> None:
             max_samples=args.max_samples,
             seed=args.seed,
         )
+    elif args.command == "validate":
+        validate(out_dir=args.out_dir, checkpoint_path=args.checkpoint_path)
     else:
         score(out_dir=args.out_dir)
 

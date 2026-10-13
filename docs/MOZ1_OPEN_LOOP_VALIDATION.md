@@ -20,7 +20,7 @@ bash cosmos_framework/scripts/run_moz1_open_loop_eval.sh
 MOZ1_EVAL_GPU=6 MOZ1_EVAL_SAMPLES=32 bash cosmos_framework/scripts/run_moz1_open_loop_eval.sh
 ```
 
-若要评估指定步数，可将 `MOZ1_EVAL_CKPT` 设为完整的 `checkpoints/iter_XXXXXXXXX` 目录；`MOZ1_EVAL_OUT` 可指定新的输出目录。默认每次生成独立的带时间戳输出目录，不覆盖既有结果。脚本会打印实际选择的 checkpoint 与结果目录，并验证 `model/.metadata` 是否存在。
+若要评估指定步数，可将 `MOZ1_EVAL_CKPT` 设为完整的 `checkpoints/iter_XXXXXXXXX` 目录；`MOZ1_EVAL_OUT` 可指定输出目录。默认每次生成独立的带时间戳输出目录。若推理失败后需要重试，设置 `MOZ1_EVAL_OUT` 为上次打印的结果目录，脚本会核对 checkpoint 与输入文件，复用已准备的样本。推理命令关闭 Guardrail，避免开环数值测评依赖额外的 Guardrail 模型文件。脚本会打印实际选择的 checkpoint 与结果目录，并验证 `model/.metadata` 是否存在。
 
 结果目录包含 `manifest.json`（抽样索引、episode 编号、种子）、`inputs/*/`（条件图、状态、真实动作和最后一帧真值图）、`predictions/*/`（生成视频与动作）、`metrics.json` 和 `per_sample.csv`。指标包括整体 MAE/RMSE、零动作基线、每维及每步 MAE、左右臂位置/旋转/夹爪及躯干位置/旋转分组误差、每个样本第 16 步的 L2 误差。只有所有样本均成功输出有限的 `[16,20]` 动作时才生成汇总指标；缺失、失败或形状错误都会报错。
 
