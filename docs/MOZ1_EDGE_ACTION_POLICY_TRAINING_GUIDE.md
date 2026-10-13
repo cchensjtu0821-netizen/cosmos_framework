@@ -609,6 +609,14 @@ Iteration 12 / trainer.max_iter 10440
 bash /srv/data2/c00932551/Nvidia_models/cosmos-framework/cosmos_framework/scripts/run_moz1_edge_train.sh
 ```
 
+如果只用物理 GPU 7 跑满正式 TOML 的 10,440 个 optimizer step，执行单卡脚本。它将 FSDP shard degree 覆盖为 1，并使用独立的 `action_policy_moz1_edge_gpu7_train` 任务名：
+
+```bash
+bash /srv/data2/c00932551/Nvidia_models/cosmos-framework/cosmos_framework/scripts/run_moz1_edge_gpu7_train.sh
+```
+
+单卡仍按正式 TOML 做 16 次梯度累积，因此每步有效 batch 为 16；8 卡脚本每步为 128。两者都跑 10,440 步时，单卡处理的样本量约为 8 卡的八分之一。
+
 如需手动启动，也可以从仓库根目录设置相同的环境变量后运行：
 
 ```bash
