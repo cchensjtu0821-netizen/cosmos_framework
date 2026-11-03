@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: OpenMDW-1.1
+
+# Single-GPU MOZ1 SFT: train only the domain-aware action input/output projectors.
+# Uses the same dataset, losses, initialization and step schedule as the existing
+# formal recipe. Supply MOZ1_ROOT, BASE_CHECKPOINT_PATH, EDGE_HF_CHECKPOINT,
+# WAN_VAE_PATH and IMAGINAIRE_OUTPUT_ROOT via the environment.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_moz1_edge"
+project    = "cosmos3_action"
+group      = "action_sft"
+name       = "action_policy_moz1_edge_domain_projector_train"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 1
+data_parallel_replicate_degree = 1
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 1.0e-05
+keys_to_select = ["action2llm", "llm2action"]
+# Each projector stores ALL domains in a dense embedding. Disable decay so
+# unused domain rows stay unchanged when starting with fresh optimizer state.
+weight_decay = 0.0
+
+# Preserve the existing recipe's 5x projector LR multipliers explicitly.
+[optimizer.lr_multipliers]
+action2llm = 5.0
+llm2action = 5.0
+
+[scheduler]
+cycle_lengths = [10440]
+warm_up_steps = [500]
+
+[trainer]
+max_iter        = 10440
+logging_iter    = 10
+grad_accum_iter = 16
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+load_training_state = false
+save_iter = 1000

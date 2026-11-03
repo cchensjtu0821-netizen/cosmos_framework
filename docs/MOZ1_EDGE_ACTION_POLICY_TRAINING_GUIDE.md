@@ -475,6 +475,46 @@ sound loss 不存在；MoE load-balancing auxiliary loss 的两个系数为 `Non
 
 Edge 配置开启 EMA；EMA 是训练权重的滑动副本，不属于 optimizer 直接更新的普通参数。
 
+### 8.2.1 仅训练 domain-aware action projector
+
+独立配置 `configs/toml_config/action_policy_moz1_edge_domain_projector_train.toml` 将
+`optimizer.keys_to_select` 设为 `["action2llm", "llm2action"]`，仅训练这两个
+`DomainAwareLinear` 的权重和 bias。Transformer（包括 `moe_gen`）、vision
+projector、timestep embedding 和 `action_modality_embed` 全部冻结。原有训练配置不受影响。
+
+MOZ1 样本使用 `domain_id=21`，因此实际数据梯度作用于两个 projector 的第 21 行。
+两个 projector 都用 dense embedding 保存所有 domain；新配置显式设置
+`weight_decay=0.0`，避免未使用的 domain 行也因 weight decay 改变。
+使用独立任务名和新的 optimizer state，勿恢复旧的全生成分支训练任务的 optimizer state。
+这里冻结的是模型参数；冻结的 Transformer 仍需传播梯度到 action 输入 projector。
+训练 loss 仍沿用 vision + action 的原配置。
+
+该配置默认单卡、梯度累积 16、10,440 步；基础 LR 为 `1e-5`，沿用两个
+action projector 的 5 倍 LR multiplier，实际 LR 还受原 scheduler 缩放。
+训练前应在服务器确认最终配置及 optimizer 的 `selected tensors: 4`
+（两个 projector 各有一个 weight embedding 和一个 bias embedding）。
+
+从仓库根目录设置第 10 节的五个路径环境变量后，先运行独立的 10 步检查：
+
+```bash
+bash cosmos_framework/scripts/run_moz1_edge_gpu7_domain_projector_train.sh \
+  job.name=action_policy_moz1_edge_domain_projector_smoke \
+  trainer.max_iter=10 trainer.grad_accum_iter=1 \
+  trainer.logging_iter=1 checkpoint.save_iter=10 \
+  'scheduler.warm_up_steps=[0]'
+```
+
+确认 loss/梯度有限、checkpoint 成功保存，并比较初始与保存的 `net`：
+只有 `action2llm`、`llm2action` 允许变化；其余参数及 projector 中其他 domain 行
+应保持不变，第 21 行应有更新。EMA 副本需单独检查，不混入 `net` 对比。
+本地未执行 GPU 训练，此检查需要在服务器完成。
+
+正式启动（默认物理 GPU 7，可通过 `CUDA_VISIBLE_DEVICES` 选择其他单卡）：
+
+```bash
+bash cosmos_framework/scripts/run_moz1_edge_gpu7_domain_projector_train.sh
+```
+
 ### 8.3 checkpoint 初始化
 
 当前从 Edge Policy DCP warm start：
