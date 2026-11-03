@@ -47,5 +47,6 @@ grad_accum_iter = 16
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
-load_training_state = false
+# load_training_state=False is inherited from the Python experiment recipe;
+# it is not a supported field in the structured TOML CheckpointConfig schema.
 save_iter = 1000
