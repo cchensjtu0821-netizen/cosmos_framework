@@ -1,5 +1,7 @@
 # MOZ1 Edge 后训练策略服务
 
+实际仿真闭环请使用 [闭环服务指南](MOZ1_ROBOLAB_CLOSED_LOOP.md) 与 `run_moz1_closed_loop_server.sh`，显式指定后训练 checkpoint。该入口与 RoboLab 当前观测交互，不依赖固定 sample。
+
 专用入口 `python -m cosmos_framework.scripts.action_policy_server_robolab_moz` 与旧 DROID 服务并存。它加载 MOZ1 Edge 训练产生的本地 DCP，通过 OpenPI MsgPack/NumPy WebSocket 协议提供在线推理。
 
 从包含 `.venv` 和 `cosmos_framework/` 的仓库根目录运行：
@@ -13,7 +15,7 @@ bash cosmos_framework/scripts/run_moz1_robolab_server.sh
 默认训练目录为：
 
 ```text
-$IMAGINAIRE_OUTPUT_ROOT/cosmos3_action/action_sft/action_policy_moz1_edge_gpu7_train
+$IMAGINAIRE_OUTPUT_ROOT/cosmos3_action/action_sft/action_policy_moz1_edge_domain_projector_train
 ```
 
 优先选择 `checkpoints/latest_checkpoint.txt` 发布的完整保存；指针缺失或保存未完成时，按 iteration 数值选择最新完整 DCP。显式指定未完成 iteration 会报错。文件预检要求非空 `model/.metadata` 和非空 `.distcp` 文件，真正的权重可加载性仍由模型加载确认。启动时固定 checkpoint，不会在服务中途追踪新权重。

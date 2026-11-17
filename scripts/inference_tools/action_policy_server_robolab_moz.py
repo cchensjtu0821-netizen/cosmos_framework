@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 import threading
+import time
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +85,10 @@ def prepare(args):
         "stats_sha256": fingerprint,
         "checkpoint": str(args.checkpoint_path),
         "use_ema_weights": False,
+        "domain_id": 21,
+        "model_action_rate_hz": 30,
+        "action_postprocessing": "inverse_training_quantile_only",
+        "supports_request_id": True,
         "generation": {
             "seed": args.seed,
             "deterministic_seed": args.deterministic_seed,
@@ -179,7 +185,12 @@ class Moz1PolicyService:
         import torch
 
         with self._lock, torch.inference_mode():
+            started = time.monotonic()
+            request_id = obs.get("request_id")
+            if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+                raise ValueError("request_id must be a nonempty string of at most 128 characters")
             batch = self._build_batch(obs)
+            prepared = time.monotonic()
             seed = self.args.seed if self.args.deterministic_seed else int(self._rng.integers(0, 2**31))
             samples = self.model.generate_samples_from_batch(
                 batch,
@@ -200,6 +211,9 @@ class Moz1PolicyService:
                 "action_space": STORED_SPACE,
                 "seed": seed,
                 "stats_sha256": self.metadata["stats_sha256"],
+                "request_id": request_id,
+                "state_sha256": hashlib.sha256(np.asarray(obs["observation/state"], dtype=np.float32).tobytes()).hexdigest(),
+                "timing": {"prepare_seconds": prepared - started, "generate_seconds": time.monotonic() - prepared},
             }
             if self.args.decode_video:
                 video = self.model.decode(samples["vision"][0])

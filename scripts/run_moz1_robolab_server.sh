@@ -26,7 +26,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES="${MOZ1_SERVER_GPU:-2}"
-export MOZ1_SERVER_CKPT="${MOZ1_SERVER_CKPT:-$IMAGINAIRE_OUTPUT_ROOT/cosmos3_action/action_sft/action_policy_moz1_edge_gpu7_train}"
+export MOZ1_SERVER_CKPT="${MOZ1_SERVER_CKPT:-$IMAGINAIRE_OUTPUT_ROOT/cosmos3_action/action_sft/action_policy_moz1_edge_domain_projector_train}"
 export MOZ1_STATS_PATH="${MOZ1_STATS_PATH:-$MOZ1_ROOT/norm_stats.json}"
 
 exec python -m cosmos_framework.scripts.action_policy_server_robolab_moz \
